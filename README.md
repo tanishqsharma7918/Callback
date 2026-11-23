@@ -27,9 +27,9 @@ So the folder needs a web address **once**. After that it lives on your Home Scr
 
 1. Create a free account at **github.com** (this is only for hosting; the app itself never asks you to sign in).
 2. Click **+** → **New repository**. Name it `callback`, choose **Public**, and click **Create repository**.
-3. On the new page click **uploading an existing file**. Open your unzipped **Callback** folder, select
-   **everything inside it** (index.html, js, lib, fonts, icons, manifest.webmanifest, sw.js and the rest) and drag it in.
-   Click **Commit changes**.
+3. On the new page click **uploading an existing file**. Open your unzipped **Callback** folder, press **⌘A** to select
+   **all the files inside it** (about 29, all side by side, with no subfolders) and drag them in. Wait until every file
+   is listed, then click **Commit changes**. On iPhone you can also tap **choose your files**, then select all files in the folder.
 4. Go to **Settings → Pages**. Under **Branch** choose **main** and **/ (root)**, then click **Save**.
 5. Wait 1–2 minutes. Your app is now at **https://YOUR-USERNAME.github.io/callback/**
 
