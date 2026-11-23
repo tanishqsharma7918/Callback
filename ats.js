@@ -229,7 +229,9 @@
 
     // Bullets
     const bulletSrc = lines(expText + '\n' + (sec.projects || '')).filter(Boolean);
-    const bullets = bulletSrc.filter((l) => BULLET_RE.test(l) || (l.length > 55 && !RANGE_TEST.test(l) && /[a-z]/.test(l)))
+    const roleTitles = roles.map((r) => r.title).filter((t) => t && t.length > 3);
+    const isHeaderLine = (l) => !BULLET_RE.test(l) && !/[.;]$/.test(l) && wc(l) <= 14 && (roleTitles.some((t) => l.startsWith(t)) || (TITLE_WORD.test(l) && /\s[—–|@]\s|\sat\s|,\s*[A-Z]{2}$/.test(l)));
+    const bullets = bulletSrc.filter((l) => !isHeaderLine(l) && (BULLET_RE.test(l) || (l.length > 55 && !RANGE_TEST.test(l) && /[a-z]/.test(l))))
       .map((l) => l.replace(BULLET_RE, '').trim()).filter((l) => wc(l) >= 4);
     const AV = new Set(T().actionVerbs);
     const quantRe = /(\d+(\.\d+)?\s?(%|x\b|k\b|m\b|mm\b|b\b|\+|percent|ms\b|hrs?\b|hours|days|weeks|users|customers|clients|people|engineers|reports|accounts|countries|stores|requests|transactions)|[$€£₹]\s?\d|\d{1,3}(,\d{3})+|\b(?!(19|20)\d{2}\b)\d{2,}\b)/i;

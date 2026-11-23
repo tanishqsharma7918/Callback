@@ -1,5 +1,5 @@
-/* Callback offline cache — callback-106dc28af40e */
-const VERSION = 'callback-106dc28af40e';
+/* Callback offline cache — callback-fa363087185a */
+const VERSION = 'callback-fa363087185a';
 const ASSETS = [
  "./",
  "ai.js",

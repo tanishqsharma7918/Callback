@@ -464,7 +464,52 @@
   V._importSheet = importSheet;
 
   // ═════════════════════════ ATS LAB ═════════════════════════
-  const A = { sort: 'score', filter: 'all' };
+  const A = { sort: 'score', filter: 'all', focus: false };
+  const VERDICT_VAR = { STRONG: '--good', COMPETITIVE: '--info', LONG_SHOT: '--warn', REJECTED: '--bad' };
+  const cssHex = (v) => { const c = getComputedStyle(document.documentElement).getPropertyValue(v).trim(); if (/^#/.test(c)) return c; const d = document.createElement('i'); d.style.color = c; document.body.appendChild(d); const m = (getComputedStyle(d).color.match(/\d+/g) || [0, 0, 0]).slice(0, 3); d.remove(); return '#' + m.map((x) => (+x).toString(16).padStart(2, '0')).join(''); };
+
+  /** Missing must-haves aggregated across open applications. */
+  function skillGaps(jobs, ats) {
+    const map = new Map();
+    jobs.filter((j) => CB.STAGE[j.status].group !== 'closed').forEach((j) => {
+      const a = ats[j.id];
+      if (!a || a.score == null) return;
+      a.skills.required.forEach((s) => {
+        if (s.kind === 'soft' || !['missing', 'listed', 'transferable'].includes(s.status)) return;
+        const g = map.get(s.name) || { name: s.name, missing: 0, listed: 0, transferable: 0, via: '', jobs: [], weight: 0 };
+        g[s.status]++;
+        if (s.via) g.via = s.via;
+        g.weight += s.weight;
+        if (!g.jobs.includes(j.company)) g.jobs.push(j.company);
+        map.set(s.name, g);
+      });
+    });
+    return [...map.values()].sort((x, y) => (y.missing * 2 + y.listed + y.transferable) * y.weight - (x.missing * 2 + x.listed + x.transferable) * x.weight).slice(0, 12);
+  }
+
+  /** Resume bullets that hurt you, with an honest rewrite template. */
+  function bulletDoctor(p) {
+    const buzz = CB.Taxonomy.buzzwords || [];
+    return p.bullets.map((b) => {
+      const issues = [];
+      if (b.weak) issues.push('Passive opener');
+      else if (!b.action) issues.push('No action verb');
+      if (!b.quantified) issues.push('No number');
+      if (b.words > 30) issues.push('Too long');
+      const bz = buzz.filter((w) => new RegExp('\\b' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(b.text));
+      if (bz.length) issues.push('Cliché: ' + bz[0]);
+      let t = b.text.trim().replace(/\.$/, '');
+      t = t.replace(/^(was )?(responsible for|in charge of|tasked with|duties included)\s+/i, 'Owned ')
+        .replace(/^(helped|assisted)( to| with| in)?\s+/i, 'Drove ')
+        .replace(/^(worked on|involved in|participated in)\s+/i, 'Built ')
+        .replace(/^(handled)\s+/i, 'Ran ');
+      if (!b.action && !b.weak && !/^(Owned|Drove|Built|Ran)\b/.test(t)) t = 'Led ' + t.charAt(0).toLowerCase() + t.slice(1);
+      bz.forEach((w) => { t = t.replace(new RegExp('\\s*\\b' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i'), ''); });
+      if (!b.quantified) t += ', [result with a number — e.g. cut X by 30%, saved 5 hrs/week, served 2M users]';
+      return { text: b.text, issues, suggestion: t.charAt(0).toUpperCase() + t.slice(1) + '.', severity: issues.length };
+    }).filter((x) => x.issues.length).sort((a, b) => b.severity - a.severity).slice(0, 8);
+  }
+
   V.ats = (root) => {
     const r = S.resume;
     const p = S.profile();
@@ -480,11 +525,27 @@
     const unscored = jobs.filter((j) => !ats[j.id] || ats[j.id].score == null).length;
     const sk = p ? [...p.skills.values()].filter((s) => s.kind !== 'soft') : [];
     const ev = (k) => sk.filter((s) => s.evidence === k);
+    const examples = jobs.filter((j) => j.sample).length;
+    const ownWithJD = jobs.filter((j) => !j.sample && String(j.jd || '').trim()).length;
+    const gaps = p ? skillGaps(jobs, ats) : [];
+    const doctor = p ? bulletDoctor(p) : [];
+    const best = jobs.filter((j) => j.status === 'saved' && ats[j.id] && ats[j.id].score != null && !ats[j.id].knockouts.length).sort((x, y) => ats[y.id].score - ats[x.id].score)[0];
+    const nextIv = jobs.flatMap((j) => (j.interviews || []).filter((i) => i.outcome === 'Scheduled' && i.datetime >= CB.todayISO()).map((i) => ({ j, i }))).sort((x, y) => x.i.datetime.localeCompare(y.i.datetime))[0];
+    const steps = p ? [
+      { done: !examples, title: examples ? `Clear the ${examples} example applications` : 'Example data cleared', text: 'They are fictional and skew your numbers.', btn: examples ? ['clear', 'Clear examples'] : null },
+      { done: audit.fails === 0, title: audit.fails ? `Fix ${audit.fails} resume problem${audit.fails > 1 ? 's' : ''} an ATS penalizes` : 'Resume passes the ATS audit', text: audit.fails ? audit.checks.filter((c) => c.status === 'fail').map((c) => c.label).slice(0, 3).join(' · ') : `Grade ${audit.grade}. Keep tightening the bullets below.`, btn: audit.fails || doctor.length ? ['doctor', 'Show fixes'] : null },
+      { done: ownWithJD >= 3, title: ownWithJD ? `Add more target jobs (${ownWithJD} so far)` : 'Add the jobs you are targeting', text: 'Paste a LinkedIn link and the posting text. Each one is scored against this resume before you apply.', btn: ['add', 'Add a job'] },
+      { done: gaps.length > 0 && gaps[0].missing === 0, title: gaps.length ? `Close your top skill gap: ${gaps[0].name}` : 'Skill gaps appear once jobs are scored', text: gaps.length ? `Asked for by ${gaps[0].jobs.length} of your open applications.` : 'Add a few postings first.', btn: gaps.length ? ['gaps', 'See skill gaps'] : null },
+      { done: false, title: best ? `Apply to your best match: ${best.company}` : 'Apply where you score 75+', text: best ? `${best.title} · ATS ${ats[best.id].score} · ${CB.UI.prob(ats[best.id])} interview chance` : 'Saved jobs scoring 75+ with no knockouts show up here.', btn: best ? ['best', 'Open it'] : ['board', 'Open pipeline'] },
+      ...(nextIv ? [{ done: false, title: `Prep for ${nextIv.j.company} · ${nextIv.i.type}`, text: CB.fmtDateTime(nextIv.i.datetime), btn: ['iv', 'Prep'] }] : []),
+    ] : [];
+    const doneCount = steps.filter((s) => s.done).length;
+
     root.innerHTML = `
       <div class="dash">
-        <section class="card span-5"><div class="card-h"><h3>Your resume</h3><span class="sub">${p ? 'Parsed like an ATS reads it' : 'PDF, Word (.docx) or text'}</span></div>
+        <section class="card span-5" id="ats-resume"><div class="card-h"><h3>Your resume</h3><span class="sub">${p ? 'Parsed like an ATS reads it' : 'PDF, Word (.docx) or text'}</span></div>
           ${r && r.sample ? '<div class="banner" style="margin-bottom:12px"><span>This is the <b>example resume</b>. Upload yours to score your real applications.</span></div>' : ''}
-          <div class="drop-zone" id="rs-drop"><div class="row" style="justify-content:center">${UI().icon('upload').replace('<svg', '<svg width="22" height="22"')}<b>${p ? 'Replace resume' : 'Upload your resume'}</b></div><span class="muted" style="font-size:12.5px">Drop a file here or choose one. Text never leaves your account.</span>
+          <div class="drop-zone" id="rs-drop"><div class="row" style="justify-content:center">${UI().icon('upload').replace('<svg', '<svg width="22" height="22"')}<b>${p ? 'Replace resume' : 'Upload your resume'}</b></div><span class="muted" style="font-size:12.5px">Drop a file here or choose one. ${CB.standalone ? 'It never leaves this device.' : 'Text never leaves your account.'}</span>
             <div class="row" style="justify-content:center"><button class="btn btn-primary" id="rs-pick">Choose file</button><button class="btn" id="rs-paste">Paste text</button></div>
             <input type="file" id="rs-file" accept=".pdf,.docx,.txt,.md,.rtf,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" hidden></div>
           ${p ? `<div style="display:grid;grid-template-columns:auto minmax(0,1fr);gap:16px;align-items:center;margin-top:14px">
@@ -493,11 +554,15 @@
             </div>
             ${App().ai ? '<div class="row" style="margin-top:12px"><button class="btn btn-sm claude-btn" id="rs-ai">Second opinion from Claude</button></div><div id="rs-ai-out" style="margin-top:10px"></div>' : ''}` : ''}
         </section>
-        <section class="card span-7"><div class="card-h"><h3>Opportunity space</h3><span class="sub">ATS fit × interview chance × days since applied · red wireframes are knockouts</span></div><div id="galaxy-slot"></div></section>
 
-        <section class="card span-12"><div class="card-h"><h3>Scoreboard</h3><span class="sub">Every tracked posting scored against your resume${unscored ? ` · ${unscored} need a job description` : ''}</span>
+        <section class="card span-7 next-card" id="ats-next"><div class="card-h"><h3>${p ? 'Your next moves' : 'Start here'}</h3><span class="sub">${p ? `${doneCount} of ${steps.length} done` : 'Upload your resume to unlock scoring'}</span></div>
+          ${p ? `<div class="steps">${steps.map((s, i) => `<div class="step ${s.done ? 'done' : ''}"><span class="step-n">${s.done ? '✓' : i + 1}</span><div style="min-width:0"><b>${E(s.title)}</b><span>${E(s.text)}</span></div>${s.btn ? `<button class="btn btn-sm ${!s.done && i === steps.findIndex((x) => !x.done) ? 'btn-primary' : ''}" data-step="${s.btn[0]}">${E(s.btn[1])}</button>` : '<span></span>'}</div>`).join('')}</div>`
+            : `<ol class="start-list"><li><b>Upload your resume</b> — PDF, Word or pasted text. Callback reads it exactly like an ATS parser.</li><li><b>Add the jobs you want</b> — paste a LinkedIn link plus the posting text; each gets a fit score, knockouts and an interview chance.</li><li><b>Fix what the scoreboard flags</b> — missing must-haves, listed-only skills, weak bullets.</li><li><b>Apply where you score 75+</b>, and track every reply on the pipeline.</li></ol>`}
+        </section>
+
+        <section class="card span-12" id="ats-board"><div class="card-h"><h3>Scoreboard</h3><span class="sub">Every tracked posting scored against your resume${unscored ? ` · ${unscored} need a job description` : ''}</span>
           <div class="right"><div class="seg-ctl" role="group" aria-label="Strictness">${Object.entries(CB.ATS.STRICT).map(([k, v]) => `<button data-strict="${k}" aria-pressed="${k === strict}">${v.label}</button>`).join('')}</div></div></div>
-          <div class="row" style="margin-bottom:12px;gap:8px">${[['all', 'All', rows.length], ['STRONG', 'Shortlist', st.verdicts.STRONG], ['COMPETITIVE', 'Review', st.verdicts.COMPETITIVE], ['LONG_SHOT', 'Long shot', st.verdicts.LONG_SHOT], ['REJECTED', 'Auto-rejected', st.verdicts.REJECTED]].map(([k, l, n]) => `<button class="btn btn-sm ${A.filter === k ? 'btn-primary' : ''}" data-vf="${k}">${l} <span class="mono" style="opacity:.7">${k === 'all' ? jobs.length - unscored : n}</span></button>`).join('')}
+          <div class="row" style="margin-bottom:12px;gap:8px">${[['all', 'All', null], ['STRONG', 'Shortlist', st.verdicts.STRONG], ['COMPETITIVE', 'Review', st.verdicts.COMPETITIVE], ['LONG_SHOT', 'Long shot', st.verdicts.LONG_SHOT], ['REJECTED', 'Auto-rejected', st.verdicts.REJECTED]].map(([k, l, n]) => `<button class="btn btn-sm ${A.filter === k ? 'btn-primary' : ''}" data-vf="${k}">${l} <span class="mono" style="opacity:.7">${k === 'all' ? jobs.length - unscored : n}</span></button>`).join('')}
             <span class="muted" style="font-size:12px;margin-left:auto">${E(T.label)}: cutoff ${T.floor} · review ${T.competitive}+ · shortlist ${T.strong}+ · must-have floor ${Math.round(T.koMQ * 100)}%</span></div>
           ${p ? `<div class="tw"><table class="t"><thead><tr><th data-s="company">Application</th><th>Status</th><th data-s="score" class="num">ATS fit</th><th>Verdict</th><th data-s="chance" class="num">Interview chance</th><th class="num">Est. rank</th><th>Knockouts / biggest gaps</th></tr></thead><tbody>
             ${rows.map(({ j, a }) => `<tr data-id="${j.id}"><td><div class="row" style="flex-wrap:nowrap;gap:10px">${UI().mono(j.company, 30)}<div style="min-width:0"><b class="ell" style="display:block;max-width:260px">${E(j.company)}</b><span class="muted ell" style="display:block;max-width:260px;font-size:12px">${E(j.title)}</span></div></div></td>
@@ -509,6 +574,23 @@
               <td style="font-size:12px;max-width:320px">${a.knockouts.length ? `<b style="color:var(--bad)">${a.knockouts.map((k) => E(k.code)).join(' ')}</b> ${E(a.knockouts[0].detail).slice(0, 90)}` : a.skills.required.filter((s) => s.status === 'missing').slice(0, 4).map((s) => `<span class="sk sk-missing" style="padding:1px 6px;margin:1px"><i>✗</i>${E(s.name)}</span>`).join('') || '<span class="muted">No major gaps</span>'}</td></tr>`).join('') || `<tr><td colspan="7" class="muted">No applications in this group.</td></tr>`}
           </tbody></table></div>` : '<p class="empty-note">Upload your resume to score all applications.</p>'}
         </section>
+
+        <section class="card span-6" id="ats-gaps"><div class="card-h"><h3>Skill gaps across your jobs</h3><span class="sub">What your open applications keep asking for</span></div>
+          ${gaps.length ? `<div class="gaps">${gaps.map((g) => `<div class="gap"><div class="gap-h"><b>${E(g.name)}</b><span class="mono muted">${g.jobs.length} job${g.jobs.length > 1 ? 's' : ''}</span></div>
+              <div class="gap-bar"><i class="m" style="flex:${g.missing}"></i><i class="l" style="flex:${g.listed}"></i><i class="t" style="flex:${g.transferable}"></i></div>
+              <span class="gap-t">${g.missing ? `Missing in ${g.missing}` : ''}${g.listed ? `${g.missing ? ' · ' : ''}In your skills list only for ${g.listed} — move it into an experience bullet` : ''}${g.transferable ? `${g.missing || g.listed ? ' · ' : ''}Partly covered by ${E(g.via)} — name the overlap` : ''}</span>
+              <span class="gap-j">${g.jobs.slice(0, 4).map(E).join(', ')}${g.jobs.length > 4 ? ` +${g.jobs.length - 4}` : ''}</span></div>`).join('')}</div>
+            <div class="row" style="margin-top:10px;gap:14px;font-size:12px;color:var(--ink-2)"><span><i class="lg m"></i>Missing</span><span><i class="lg l"></i>Listed only</span><span><i class="lg t"></i>Transferable</span></div>`
+            : `<p class="empty-note">${p ? 'No gaps across your open applications. Add more postings to see patterns.' : 'Upload your resume to see which skills your target jobs keep asking for.'}</p>`}
+        </section>
+        <section class="card span-6" id="ats-doctor"><div class="card-h"><h3>Bullet doctor</h3><span class="sub">${p ? `${doctor.length} bullet${doctor.length === 1 ? '' : 's'} costing you points` : 'Rewrites for weak resume bullets'}</span></div>
+          ${doctor.length ? doctor.map((d, i) => `<div class="doc"><div class="row" style="gap:6px">${d.issues.map((x) => `<span class="tag" style="color:var(--bad)">${E(x)}</span>`).join('')}</div>
+              <p class="doc-old">${E(d.text)}</p><p class="doc-new"><b>Try:</b> ${E(d.suggestion)}</p><button class="btn btn-ghost btn-sm" data-copy-doc="${i}">Copy rewrite</button></div>`).join('')
+            : `<p class="empty-note">${p ? 'Every bullet opens with a strong verb and carries a number. Nice.' : 'Upload your resume to get bullet-by-bullet rewrites.'}</p>`}
+          ${doctor.length ? '<p class="muted" style="font-size:12px;margin:8px 0 0">Fill the brackets with true numbers from your work. Never invent metrics — recruiters ask about them.</p>' : ''}
+        </section>
+
+        <section class="card span-12" id="ats-space"><div class="card-h"><h3>Opportunity space</h3><span class="sub">ATS fit × interview chance × days since applied · tap a point to inspect it · red wireframes are knockouts</span></div><div id="galaxy-slot"></div></section>
 
         <section class="card span-6"><div class="card-h"><h3>Resume audit</h3><span class="sub">${audit ? `Grade ${audit.grade} · ${audit.score}/100 · ${audit.fails} fails · ${audit.warns} warnings` : 'Upload a resume'}</span></div>
           ${audit ? audit.checks.map((c) => `<div class="check-row"><span class="ci ci-${c.status}">${c.status === 'pass' ? '✓' : c.status === 'warn' ? '!' : '✗'}</span><div><b>${E(c.label)}</b><span>${E(c.detail)}</span></div></div>`).join('') : '<p class="empty-note">The audit checks contact info, section headings, parseable dates, quantified impact, action verbs, clichés, skill evidence, gaps and length.</p>'}
@@ -532,7 +614,7 @@
         <section class="card span-12"><details><summary style="cursor:pointer;font-weight:650;font-family:var(--f-display);font-size:15.5px">How the score works</summary>
           <div class="grid2" style="margin-top:12px;font-size:13px;line-height:1.6">
             <div><p><b>1. Knockouts first.</b> Like Workday or Greenhouse screening questions, these reject before anyone reads your resume: work authorization (DQ-AUTH), clearance (DQ-CLR), years below ${Math.round(T.koYoeRatio * 100)}% of the minimum (DQ-YOE), a required degree with no equivalent-experience clause (DQ-DEG), required licenses (DQ-CERT), languages (DQ-LANG), a 3+ level seniority jump (DQ-SEN)${T.koLocation ? ', on-site roles you can’t reach (DQ-LOC)' : ''}, under ${Math.round(T.koMQ * 100)}% of must-have skills (DQ-MQ), and a final fit score under ${T.floor} (DQ-SCORE).</p>
-            <p><b>2. Ranking.</b> Must-have skills 36%, experience 16%, title &amp; seniority 12%, domain keywords 10%, nice-to-haves 8%, education 7%, resume quality 6%, logistics 5%. Skills earn full credit only when used in experience bullets; listed-only skills earn ${Math.round(T.listedCredit * 100)}%; close substitutes (e.g. GCP for AWS) earn partial credit. Each missing must-have costs another ${T.gapPenalty} points, and ${T.label} mode bends the curve down.</p></div>
+            <p><b>2. Ranking.</b> Must-have skills 36%, experience 16%, title &amp; seniority 12%, domain keywords 10%, nice-to-haves 8%, education 7%, resume quality 6%, logistics 5%. Skills earn full credit only when used in experience bullets; listed-only skills earn ${Math.round(T.listedCredit * 100)}%; close substitutes (e.g. GCP for AWS) earn partial credit; "Go or Python" style requirements are met by either. Each missing must-have costs another ${T.gapPenalty} points, and ${T.label} mode bends the curve down.</p></div>
             <div><p><b>3. Interview chance.</b> A logistic curve centered at 82 (a fit of 82 alone ≈ 22%), multiplied by source (referral ×3.2, recruiter outreach ×4, Easy Apply ×0.6), applicant volume (500+ ×0.5, under 25 ×1.35) and how fast you applied (within 2 days ×1.25, after 45 days ×0.55). Knockouts cap the chance at 0.4%.</p>
             <p><b>4. Rank.</b> Your fit is placed in a modeled applicant pool (mean 57, SD 13) of the posting's applicant count, or a typical count for the source. Recruiters usually read the top 10–25%.</p>
             <p class="muted">${CB.standalone ? 'The engine runs entirely on this device — no account, no upload, nothing leaves your phone or computer.' : 'The engine runs entirely on this page. "Re-read with Claude" and "Run review" add an AI read on top, using your claude.ai account.'}</p></div>
@@ -541,12 +623,12 @@
     // resume upload
     const fileIn = $('#rs-file', root);
     $('#rs-pick', root).onclick = () => fileIn.click();
-    fileIn.onchange = () => UI().uploadResume(fileIn.files[0]);
-    $('#rs-paste', root).onclick = () => UI().pasteResume();
+    fileIn.onchange = () => { A.focus = true; UI().uploadResume(fileIn.files[0]); };
+    $('#rs-paste', root).onclick = () => { A.focus = true; UI().pasteResume(); };
     const dz = $('#rs-drop', root);
     dz.ondragover = (e) => { e.preventDefault(); dz.classList.add('over'); };
     dz.ondragleave = () => dz.classList.remove('over');
-    dz.ondrop = (e) => { e.preventDefault(); dz.classList.remove('over'); UI().uploadResume(e.dataTransfer.files[0]); };
+    dz.ondrop = (e) => { e.preventDefault(); dz.classList.remove('over'); A.focus = true; UI().uploadResume(e.dataTransfer.files[0]); };
     if (p) CB.Charts.ring($('#rs-ring', root), audit.score / 100, { label: audit.grade, sub: `resume ${audit.score}/100`, size: 110, stroke: 9, color: UI().compColor(audit.score) });
     const rai = $('#rs-ai', root);
     if (rai) rai.onclick = async () => {
@@ -557,18 +639,35 @@
         out.innerHTML = `<div class="ai-box ai-out"><p><b>${E(x.headline || x.currentTitle || '')}</b> · Claude reads ${E(x.totalYears)} years as <b>${E(x.seniority || '')}</b></p><h4>Strengths</h4><ul>${(x.strengths || []).map((s) => `<li>${E(s)}</li>`).join('')}</ul><h4>Weaknesses</h4><ul>${(x.weaknesses || []).map((s) => `<li>${E(s)}</li>`).join('')}</ul>${Math.abs((+x.totalYears || 0) - p.totalYears) >= 1 ? `<p class="muted">Claude counts ${E(x.totalYears)} years; the local parser counts ${p.totalYears}. If yours is wrong, set an override in Settings.</p>` : ''}</div>`;
       } catch (e) { out.innerHTML = `<p class="muted">${E(CB.AI.errText(e))}</p>`; }
     };
+    // next-step buttons
+    const scrollTo = (id) => { const el = $(id, root); if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1400); } };
+    $$('[data-step]', root).forEach((b) => (b.onclick = async () => {
+      const k = b.dataset.step;
+      if (k === 'clear') { if (await UI().confirm({ title: 'Clear example data?', text: 'Removes the 22 fictional applications. Your resume and your own entries stay.', ok: 'Clear examples' })) { const n = S.clearSamples(); UI().toast(`Removed ${n} examples`); } }
+      else if (k === 'doctor') scrollTo(doctor.length ? '#ats-doctor' : '#ats-gaps');
+      else if (k === 'add') UI().addJob();
+      else if (k === 'gaps') scrollTo('#ats-gaps');
+      else if (k === 'best' && best) UI().openJob(best.id, 'ats');
+      else if (k === 'board') location.hash = 'board';
+      else if (k === 'iv' && nextIv) UI().openJob(nextIv.j.id, 'interviews');
+    }));
+    $$('[data-copy-doc]', root).forEach((b) => (b.onclick = () => UI().copy(doctor[+b.dataset.copyDoc].suggestion)));
+    if (A.focus && p) { A.focus = false; setTimeout(() => scrollTo('#ats-next'), 120); }
     $$('[data-strict]', root).forEach((b) => (b.onclick = () => { S.setSettings({ strictness: b.dataset.strict }); UI().toast(`${CB.ATS.STRICT[b.dataset.strict].label} mode · all applications re-scored`); }));
     $$('[data-vf]', root).forEach((b) => (b.onclick = () => { A.filter = b.dataset.vf; V.ats(root); }));
     $$('[data-s]', root).forEach((th) => { th.style.cursor = 'pointer'; th.onclick = () => { A.sort = th.dataset.s; V.ats(root); }; });
-    $$('tbody tr[data-id]', root).forEach((tr) => (tr.onclick = () => UI().openJob(tr.dataset.id, 'ats')));
+    $$('tbody tr[data-id]', root).forEach((tr) => {
+      tr.onclick = () => UI().openJob(tr.dataset.id, 'ats');
+      tr.onpointerenter = (e) => { if (e.pointerType === 'mouse' && persist.galaxy && persist.galaxy.highlight) persist.galaxy.highlight(tr.dataset.id); };
+      tr.onpointerleave = (e) => { if (e.pointerType === 'mouse' && persist.galaxy && persist.galaxy.highlight) persist.galaxy.highlight(null); };
+    });
     CB.Charts.atsHistogram($('#calib', root), st.atsBuckets, { floor: T.floor, competitive: T.competitive });
     // quick check
-    let qcJob = null;
     $('#qc-go', root).onclick = () => {
       const jd = $('#qc-text', root).value.trim();
       if (jd.length < 80) { UI().toast('Paste a full job description.', { tone: 'warn' }); return; }
       const post = CB.ATS.extractPosting(jd, '');
-      qcJob = CB.newJob({ title: $('#qc-title', root).value.trim() || post.title, company: post.company, location: post.location, workMode: post.workMode, jd: post.jd || jd, applicants: post.applicants ? post.applicants.n : null });
+      const qcJob = CB.newJob({ title: $('#qc-title', root).value.trim() || post.title, company: post.company, location: post.location, workMode: post.workMode, jd: post.jd || jd, applicants: post.applicants ? post.applicants.n : null });
       qcJob.updatedAt = 'qc-' + CB.hash(jd + qcJob.title);
       const a = S.atsFor(qcJob);
       const out = $('#qc-out', root);
@@ -577,17 +676,23 @@
       $('#qc-track', root).hidden = false;
     };
     $('#qc-track', root).onclick = () => UI().addJob({ jd: $('#qc-text', root).value });
-    // galaxy (persistent)
+    // galaxy (persistent WebGL scene, re-parented on refresh)
     const slot = $('#galaxy-slot', root);
-    const pts = jobs.map((j) => ({ j, a: ats[j.id] })).filter((x) => x.a && x.a.score != null).map(({ j, a }) => ({ id: j.id, label: j.company, sub: j.title, x: a.score, y: Math.min(a.probability, 0.8), z: j.appliedDate ? Math.max(0, CB.daysSince(j.appliedDate)) : 0, size: CB.clamp(((j.salaryMax || j.salaryMin || 120000) - 80000) / 220000, 0, 1), color: UI().stageHex(j.status), knocked: a.knockouts.length > 0, statusLabel: CB.STAGE[j.status].label }));
+    const pts = jobs.map((j) => ({ j, a: ats[j.id] })).filter((x) => x.a && x.a.score != null).map(({ j, a }) => ({
+      id: j.id, label: j.company, sub: j.title, x: a.score, y: Math.min(a.probability, 0.8), z: j.appliedDate ? Math.max(0, CB.daysSince(j.appliedDate)) : 0,
+      size: CB.clamp(((j.salaryMax || j.salaryMin || 120000) - 80000) / 220000, 0, 1), color: UI().stageHex(j.status), status: j.status, statusLabel: CB.STAGE[j.status].label,
+      verdict: a.verdict, verdictColor: cssHex(VERDICT_VAR[a.verdict] || '--muted'), knocked: a.knockouts.length > 0, active: CB.STAGE[j.status].group !== 'closed',
+    }));
     if (!persist.galaxyHost) { persist.galaxyHost = document.createElement('div'); persist.galaxyHost.className = 'galaxy'; }
     slot.replaceWith(persist.galaxyHost);
     const theme = UI().theme3d();
-    if (persist.galaxy) persist.galaxy.update(pts, theme);
+    const thresholds = { floor: T.floor, competitive: T.competitive };
+    const onOpen = (id, tab) => UI().openJob(id, tab || 'overview');
+    if (persist.galaxy) persist.galaxy.update(pts, theme, { thresholds });
     else if (CB.Viz3D && CB.Viz3D.available && CB.Viz3D.available()) {
-      try { persist.galaxy = CB.Viz3D.createGalaxy(persist.galaxyHost, { points: pts, theme, onPick: (id) => UI().openJob(id, 'ats') }); } catch (e) { console.error(e); persist.galaxy = null; }
+      try { persist.galaxy = CB.Viz3D.createGalaxy(persist.galaxyHost, { points: pts, theme, thresholds, onOpen, onPick: (id) => onOpen(id, 'ats') }); } catch (e) { console.error(e); persist.galaxy = null; }
     }
-    if (!persist.galaxy) persist.galaxyHost.innerHTML = '<p class="empty-note" style="padding:20px">3D view needs WebGL. The scoreboard below has the same data.</p>';
+    if (!persist.galaxy) persist.galaxyHost.innerHTML = '<p class="empty-note" style="padding:20px">3D view needs WebGL. The scoreboard above has the same data.</p>';
     onLeave('ats', () => { if (persist.galaxy) { persist.galaxy.destroy(); persist.galaxy = null; } persist.galaxyHost = null; });
   };
   const App = () => CB.App;

@@ -95,7 +95,8 @@
     if (opts.undo) t.querySelector('button').onclick = () => { const u = S().undo(); t.remove(); if (u) UI.toast('Undone'); };
     host.appendChild(t);
     while (host.children.length > 3) host.firstChild.remove();
-    setTimeout(() => t.remove(), opts.undo ? 6500 : 3600);
+    setTimeout(() => t.remove(), opts.ms || (opts.undo ? 6500 : 3600));
+    return t;
   };
   CB.on('toast', (d) => UI.toast(d.text, { tone: d.tone }));
 
@@ -187,14 +188,16 @@
   // ───────────────────────── resume ─────────────────────────
   UI.uploadResume = async (file) => {
     if (!file) return;
-    UI.toast('Reading ' + file.name + '…');
+    const reading = UI.toast('Reading ' + file.name + '…', { ms: 20000 });
     try {
       const r = await CB.IO.extractText(file);
+      reading.remove();
       if (!r.text || r.text.trim().length < 80) throw new Error('No readable text found. If it is a scanned PDF, export it as a text PDF or .docx — an ATS sees a blank resume too.');
       S().setResume({ text: r.text, fileName: file.name, uploadedAt: CB.nowISO(), warnings: r.warnings || [], pages: r.pages || null, kind: r.kind, sample: false });
       const p = S().profile();
-      UI.toast(`Resume parsed: ${p.skills.size} skills · ${p.totalYears} yrs · ${p.roles.length} roles. All applications re-scored.`);
-    } catch (e) { UI.toast(e.message || 'Could not read that file.', { tone: 'bad' }); }
+      UI.toast(`Resume parsed: ${p.skills.size} skills · ${p.totalYears} yrs · ${p.roles.length} roles. All applications re-scored — see your next moves below.`, { ms: 5000 });
+      CB.emit('resume:uploaded', { grade: CB.ATS.auditResume(p, r.warnings || []) });
+    } catch (e) { reading.remove(); UI.toast(e.message || 'Could not read that file.', { tone: 'bad' }); }
   };
   UI.pasteResume = () => {
     UI.modal({

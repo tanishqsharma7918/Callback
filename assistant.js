@@ -441,6 +441,21 @@ ${JSON.stringify(overview())}`;
         return say(to === 'rejected' ? `Moved **${j.company}** to Rejected. If they gave a reason, add it in the drawer — it sharpens your reports.` : to === 'offer' ? `An offer from **${j.company}**! Add base, bonus and equity in the Overview tab and I'll compare it with the posted range.` : `Moved **${j.company}** to **${CB.STAGE[to].label}**.`);
       }
     }
+    if (/\b(what (can|should|do) i do next|what next|now what|next (moves?|steps?)|after (uploading|my resume|the resume)|what('?s| is) next after|uploaded my resume)\b/.test(t) || (/\bresume\b/.test(t) && /\b(next|now|then|after)\b/.test(t))) {
+      const p = S().profile();
+      if (!p) return say('First upload your resume in **ATS Lab** (PDF, Word or pasted text). Every job gets scored against it the moment it\'s in.');
+      const audit = CB.ATS.auditResume(p, (S().resume && S().resume.warnings) || []);
+      const ex = S().list().filter((x) => x.sample).length;
+      act('Opened ATS Lab · Your next moves');
+      location.hash = 'ats';
+      return say(`Your resume reads as **${CB.ATS.levelLabel(p.level)}** with ${p.totalYears} years and grades **${audit.grade}** (${audit.score}/100). Here's the order I'd go in:\n${[
+        ex ? `**Clear the ${ex} example jobs** (Dashboard → Clear examples) so the numbers are yours.` : '',
+        audit.fails ? `**Fix ${audit.fails} resume problem${audit.fails > 1 ? 's' : ''}**: ${audit.checks.filter((c) => c.status === 'fail').map((c) => c.label).slice(0, 3).join(', ')} — the **Bullet doctor** card has rewrites.` : '',
+        '**Add the jobs you want**: tap **+**, paste the LinkedIn link and the posting text. You get a verdict before you apply.',
+        '**Check Skill gaps** in ATS Lab — the skills your target jobs keep asking for that your resume lacks.',
+        '**Apply where you score 75+**, then log every reply on the Pipeline (or paste the email into Inbox Parser).',
+      ].filter(Boolean).map((x, i) => `${i + 1}. ${x}`).join('\n')}`);
+    }
     if (/\b(due|to ?do|today|pending|tasks?|actions?|what should i do|what'?s next|next steps?)\b/.test(t) && !/interview/.test(t)) {
       const o = overview();
       if (!o.actionsDue.length) return say('Nothing is due. Good moment to apply to a posting scoring 75+ — open **ATS Lab** to see your best matches.');
@@ -540,6 +555,7 @@ ${JSON.stringify(overview())}`;
     try { A.log = JSON.parse(localStorage.getItem(LS) || '[]').slice(-40); A.turns = A.log.filter((m) => m.text && !m.local).map((m) => ({ role: m.who === 'me' ? 'user' : 'assistant', content: m.text })).slice(-12); } catch (e) { A.log = []; }
     voiceSetup();
     CB.on('moved', (d) => react(d));
+    CB.on('resume:uploaded', (d) => setTimeout(() => { setMascot('happy', 2400); bubble(`Resume graded <b>${E(d.grade.grade)}</b> (${d.grade.score}/100). Next: add the jobs you're targeting — tap me and say <b>"what next?"</b>`, 9000); }, 5200));
     CB.on('cal:react', (d) => setMascot(d.state, 1600));
     CB.on('data', CB.debounce(nudge, 1500));
     setTimeout(nudge, 2500);
@@ -612,7 +628,7 @@ ${JSON.stringify(overview())}`;
     const chips = [];
     if (o && o.actionsDue.length) chips.push("What's due today?");
     if (o && o.upcomingInterviews.length) chips.push('My upcoming interviews');
-    chips.push('Schedule an interview', 'How am I doing?', 'Which jobs should I focus on?', 'Add a job from a link', 'Export to Excel', 'How does the ATS score work?', 'How do I add a LinkedIn job?');
+    chips.push('What next after my resume?', 'Schedule an interview', 'How am I doing?', 'Which jobs should I focus on?', 'Add a job from a link', 'Export to Excel', 'How does the ATS score work?', 'How do I add a LinkedIn job?');
     $('#cal-chips').innerHTML = chips.map((c) => `<button type="button" data-chip="${E(c)}">${E(c)}</button>`).join('');
     document.querySelectorAll('#cal-chips [data-chip]').forEach((b) => (b.onclick = () => {
       const c = b.dataset.chip;

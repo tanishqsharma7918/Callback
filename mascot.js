@@ -312,16 +312,19 @@
     function setState(s, ms) {
       F.state = s;
       F.dirty = true;
+      lastInteract = performance.now();
       if (ms) { revertAt = performance.now() + ms; } else { revertAt = 0; base = s; }
       kick();
     }
     // pointer look
+    let lastInteract = performance.now();
     const look = { x: 0, y: 0 };
     const onMove = (e) => {
       const r = container.getBoundingClientRect();
       const cx = r.left + r.width / 2, cy = r.top + r.height * 0.4;
       look.x = CB.clamp((e.clientX - cx) / (window.innerWidth * 0.5), -1, 1);
       look.y = CB.clamp(-(e.clientY - cy) / (window.innerHeight * 0.5), -1, 1);
+      lastInteract = performance.now();
       kick();
     };
     window.addEventListener('pointermove', onMove, { passive: true });
@@ -332,6 +335,7 @@
     // ── size / visibility ──
     function resize() {
       const w = Math.max(40, container.clientWidth), h = Math.max(40, container.clientHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, w < 160 ? 1.5 : 2));
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
       // keep the character framed in tall and wide boxes alike
@@ -357,6 +361,11 @@
     function frame(now) {
       if (destroyed) return;
       if (!visible || document.hidden) { running = false; return; }
+      // Battery/perf: 30 fps in the dock, 60 in the panel; drop to 15/30 after 6 s without interaction.
+      const small = container.clientWidth < 160;
+      const busy = F.state !== 'idle' || now - lastInteract < 6000;
+      const interval = small ? (busy ? 33 : 66) : (busy ? 15 : 33);
+      if (now - last < interval) { raf = requestAnimationFrame(frame); return; }
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       t += dt;
