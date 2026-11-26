@@ -1,11 +1,14 @@
 /* Callback — app shell, shared UI components, job drawer, add-job flow, palette. Views live in views.js. */
 (function () {
   'use strict';
-  const CB = window.CB;
+  const CB = (window.CB = window.CB || {});
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const E = CB.esc;
-  const S = () => CB.Store;
+  // If store.js failed to load, the shell still renders against this inert stand-in.
+  const NULL_STORE = { ready: false, mode: 'loading', stale: false, settings: {}, resume: null, list: () => [], get: () => null, profile: () => null, atsFor: () => ({ score: null, verdict: 'ERROR', verdictLabel: 'Unavailable', knockouts: [], components: [], skills: { required: [], preferred: [] }, keywords: { matched: [], missing: [] }, fixes: [] }), atsMap: () => ({}), undo: () => null, init: async () => {} };
+  const S = () => CB.Store || NULL_STORE;
+  const noop = () => {};
 
   const ICON = {
     dashboard: '<path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-3H4zM14 4v3h6V4z"/>',
@@ -37,30 +40,58 @@
     mic: '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8"/>',
     spark: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/>',
   };
-  const icon = (n, cls = '') => `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[n] || ''}</svg>`;
+  /** icon(name) → inline SVG. `name` may also be raw SVG (`<svg …>`) or SVG child markup (`<path …/>`) from a feature module. */
+  const icon = (n, cls = '') => {
+    const raw = ICON[n] || (typeof n === 'string' && n.trim().charAt(0) === '<' ? n.trim() : '');
+    if (/^<svg/i.test(raw)) return raw;
+    return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${raw}</svg>`;
+  };
+  const iconOr = (n) => (ICON[n] || (typeof n === 'string' && n.trim().charAt(0) === '<') ? icon(n) : icon('spark'));
 
-  const VIEWS = [
-    { key: 'dashboard', label: 'Dashboard', icon: 'dashboard', sec: 'Track' },
-    { key: 'board', label: 'Pipeline', icon: 'board', sec: 'Track' },
-    { key: 'sheet', label: 'Spreadsheet', icon: 'sheet', sec: 'Track' },
-    { key: 'calendar', label: 'Calendar', icon: 'calendar', sec: 'Track' },
-    { key: 'ats', label: 'ATS Lab', icon: 'ats', sec: 'Analyze' },
-    { key: 'inbox', label: 'Inbox Parser', icon: 'inbox', sec: 'Analyze' },
-    { key: 'reports', label: 'Reports & Export', icon: 'reports', sec: 'Analyze' },
-    { key: 'settings', label: 'Settings', icon: 'settings', sec: 'You' },
+  // Built-in views; registered views (CB.registerView) merge in by section, then `order`.
+  const SECS = ['Track', 'Analyze', 'You'];
+  const BUILTIN_VIEWS = [
+    { key: 'dashboard', label: 'Dashboard', icon: 'dashboard', sec: 'Track', order: 10 },
+    { key: 'board', label: 'Pipeline', icon: 'board', sec: 'Track', order: 20 },
+    { key: 'sheet', label: 'Spreadsheet', icon: 'sheet', sec: 'Track', order: 30 },
+    { key: 'calendar', label: 'Calendar', icon: 'calendar', sec: 'Track', order: 40 },
+    { key: 'ats', label: 'ATS Lab', icon: 'ats', sec: 'Analyze', order: 10 },
+    { key: 'inbox', label: 'Inbox Parser', icon: 'inbox', sec: 'Analyze', order: 20 },
+    { key: 'reports', label: 'Reports & Export', icon: 'reports', sec: 'Analyze', order: 30 },
+    { key: 'settings', label: 'Settings', icon: 'settings', sec: 'You', order: 100 },
   ];
+  const BUILTIN_KEYS = new Set(BUILTIN_VIEWS.map((v) => v.key));
   const CRUMB = {
     dashboard: 'Your search at a glance', board: 'Drag cards between stages', sheet: 'Excel-style grid · edit any cell',
     calendar: 'Interviews, follow-ups and deadlines', ats: 'Resume vs. every posting, scored brutally', inbox: 'Paste recruiter emails, update automatically',
     reports: 'Excel, Word, CSV and backups', settings: 'Eligibility, strictness, goals and data',
   };
+  const BUILTIN_TABS = ['overview', 'ats', 'interviews', 'contacts', 'docs', 'timeline'];
+  const reg = (list) => (CB._reg && CB._reg[list]) || [];
+  const warned = new Set();
+  const warnOnce = (msg) => { if (!warned.has(msg)) { warned.add(msg); console.warn('[Callback] ' + msg); } };
+  let VIEWS = BUILTIN_VIEWS.slice();
+  function buildViews() {
+    const extra = reg('views').filter((v) => {
+      if (BUILTIN_KEYS.has(v.key)) { warnOnce(`registerView: "${v.key}" is a built-in view key; ignored.`); return false; }
+      return true;
+    }).map((v) => ({ key: v.key, label: v.label, icon: v.icon, sec: v.sec, order: v.order, crumb: v.crumb, reg: v }));
+    VIEWS = BUILTIN_VIEWS.concat(extra).map((v, i) => ({ v, i }))
+      .sort((a, b) => SECS.indexOf(a.v.sec) - SECS.indexOf(b.v.sec) || a.v.order - b.v.order || a.i - b.i)
+      .map((x) => x.v);
+    return VIEWS;
+  }
+  buildViews();
+  const viewMeta = (k) => VIEWS.find((x) => x.key === k) || null;
+  const crumbFor = (v) => (v ? (v.reg ? v.crumb : CRUMB[v.key]) || '' : '');
 
-  const App = { current: null, cleanup: [], ai: false, drawerId: null, drawerTab: 'overview', busy: false };
+  const App = { current: null, cleanup: [], ai: false, drawerId: null, drawerTab: 'overview', busy: false, booted: false, wanted: '' };
+  App.views = () => VIEWS.slice();
 
   // ───────────────────────── shared components ─────────────────────────
   const UI = {};
   UI.icon = icon;
-  UI.chip = (key, extra = '') => { const s = CB.STAGE[key] || CB.STAGE.saved; return `<span class="chip ${extra}" style="--c:var(--st-${s.key})">${E(s.label)}</span>`; };
+  UI.chip = (key, extra = '') => { const s = CB.STAGE[key] || CB.STAGE.saved; return `<span class="chip st-${s.key} ${extra}" style="--c:var(--st-${s.key})">${E(s.label)}</span>`; };
   UI.scoreClass = (a) => {
     if (!a || a.score == null) return '';
     if (a.knockouts && a.knockouts.length) return 's-bad';
@@ -86,19 +117,131 @@
     return t ? CB.daysSince(t.slice(0, 10)) : null;
   };
 
-  // toasts
+  // toasts — opts: {tone:'bad'|'warn'|'err', undo, action:{label, run}, ms}
+  function toastHost() {
+    let h = $('#toasts');
+    if (!h) { h = document.createElement('div'); h.id = 'toasts'; h.setAttribute('aria-live', 'polite'); document.body.appendChild(h); }
+    return h;
+  }
   UI.toast = (text, opts = {}) => {
-    const host = $('#toasts');
+    const host = toastHost();
     const t = document.createElement('div');
     t.className = 'toast' + (opts.tone ? ' ' + opts.tone : '');
-    t.innerHTML = `<span>${E(text)}</span>${opts.undo ? '<button type="button">Undo</button>' : ''}`;
-    if (opts.undo) t.querySelector('button').onclick = () => { const u = S().undo(); t.remove(); if (u) UI.toast('Undone'); };
+    t.setAttribute('role', opts.tone === 'bad' ? 'alert' : 'status');
+    const act = opts.action && typeof opts.action.run === 'function' ? opts.action : null;
+    t.innerHTML = `<span>${E(text)}</span>${opts.undo ? '<button type="button" data-undo>Undo</button>' : ''}${act ? `<button type="button" data-act>${E(act.label || 'Open')}</button>` : ''}`;
+    if (opts.undo) t.querySelector('[data-undo]').onclick = () => { const u = S().undo(); t.remove(); if (u) UI.toast('Undone'); };
+    if (act) t.querySelector('[data-act]').onclick = () => {
+      t.remove();
+      try { const r = act.run(); if (r && typeof r.then === 'function') r.then(null, (e) => CB.reportError(e, { where: 'toast action' })); }
+      catch (e) { CB.reportError(e, { where: 'toast action' }); }
+    };
     host.appendChild(t);
     while (host.children.length > 3) host.firstChild.remove();
-    setTimeout(() => t.remove(), opts.ms || (opts.undo ? 6500 : 3600));
+    setTimeout(() => { if (!t.isConnected) return; t.classList.add('out'); setTimeout(() => t.remove(), 200); }, opts.ms || (opts.undo || act ? 6500 : 3600));
     return t;
   };
-  CB.on('toast', (d) => UI.toast(d.text, { tone: d.tone }));
+  CB.on('toast', (d) => { if (d && d.text) UI.toast(d.text, d); });
+
+  // ───────────────────────── error boundary ─────────────────────────
+  // core.js records every uncaught error / rejection / script load failure (CB.reportError → 'error').
+  // Here they become a calm, non-blocking toast with "Details". Never alert().
+  const errText = (rec) => [
+    rec.message, rec.where ? 'Where: ' + rec.where : '', 'When: ' + rec.at, 'View: ' + (App.current || '—') + (App.drawerId ? ' · drawer ' + App.drawerTab : ''),
+    'Data: ' + S().mode + ' · ' + S().list().length + ' applications', 'Browser: ' + navigator.userAgent, rec.stack ? '\n' + rec.stack : '',
+  ].filter(Boolean).join('\n');
+  const ERR = { last: 0, seen: new Map() };
+  function onAppError(rec) {
+    if (!rec || rec.silent) return;
+    if (!App.booted) return; // summarized once at boot (CB.errors also holds what happened before this file ran)
+    const now = Date.now();
+    const key = rec.kind + '|' + rec.message;
+    if (now - (ERR.seen.get(key) || -1e9) < 60000) return; // same problem: once a minute at most
+    ERR.seen.set(key, now);
+    if (now - ERR.last < 3000) return; // a burst: the first toast's Details lists the rest
+    ERR.last = now;
+    UI.toast(rec.kind === 'load' ? rec.message : 'Something went wrong, but Callback kept running.', { tone: 'err', ms: 8000, action: { label: 'Details', run: () => UI.errorDetails(rec) } });
+  }
+  CB.on('error', onAppError);
+  /** Details sheet for an error record (defaults to the latest). */
+  UI.errorDetails = (rec) => {
+    const all = (CB.errors || []).filter((r) => !r.silent);
+    rec = rec || all[all.length - 1] || (CB.errors || [])[CB.errors.length - 1];
+    if (!rec) { UI.toast('No problems recorded.'); return; }
+    const others = all.filter((r) => r !== rec).slice(-4).reverse();
+    const txt = errText(rec) + (others.length ? '\n\nEarlier:\n' + others.map((r) => `${r.at.slice(11, 19)} ${r.where ? r.where + ' · ' : ''}${r.message}`).join('\n') : '');
+    UI.modal({
+      title: 'What went wrong', size: 'sm',
+      body: `<p class="muted" style="margin:0 0 12px">Callback caught this problem and kept running. Your data is safe. If it keeps happening, copy the details and send them along.</p><pre class="cb-err-pre">${E(txt)}</pre>`,
+      foot: '<button class="btn" data-reload-app>Reload app</button><span style="flex:1"></span><button class="btn" data-copy>Copy details</button><button class="btn btn-primary" data-c>Done</button>',
+      onMount: (m, api) => {
+        m.querySelector('[data-copy]').onclick = () => UI.copy(txt);
+        m.querySelector('[data-c]').onclick = () => api.close();
+        m.querySelector('[data-reload-app]').onclick = () => location.reload();
+      },
+    });
+  };
+  /** Turn 3D off for this device (GL hub Safe Mode). Returns true when the hub accepted it. */
+  UI.disable3D = () => {
+    let ok = false;
+    try {
+      // safeMode(true) is remembered across launches; setTier('safe') only lasts this session.
+      if (CB.GL && typeof CB.GL.safeMode === 'function') { CB.GL.safeMode(true); ok = true; }
+      else if (CB.GL && typeof CB.GL.setTier === 'function') { CB.GL.setTier('safe'); ok = true; }
+    } catch (e) { CB.reportError(e, { where: 'gl:safeMode', silent: true }); }
+    CB.emit('3d', { on: false });
+    return ok;
+  };
+  const glOn = () => {
+    try {
+      if (!CB.GL || (typeof CB.GL.safeMode !== 'function' && typeof CB.GL.setTier !== 'function')) return false;
+      if (typeof CB.GL.safeMode === 'function') return !CB.GL.safeMode();
+      return typeof CB.GL.tier !== 'function' || CB.GL.tier() !== 'safe';
+    } catch (e) { return false; }
+  };
+  /**
+   * Replace `host` with a recovery card for `err`. opts: {onReload(), inline (inside a card)}.
+   * Used for views, drawer tabs, dash cards and settings cards; feature modules may call it too.
+   */
+  UI.recover = (host, err, where, opts = {}) => {
+    // A module that failed to load is an environment problem (already in the console); a thrown render is a bug.
+    // After a script failed to load, render errors are its consequences, not new bugs.
+    const loadIssue = !!(err && err.cbLoad) || !!(CB._loadFailures && CB._loadFailures.length);
+    const rec = CB.reportError(err, { where, silent: true, kind: loadIssue ? 'load' : 'error', log: !loadIssue }) || { message: String((err && err.message) || err), at: CB.nowISO(), where };
+    if (loadIssue) console.warn('[Callback] ' + (where || '') + ': ' + rec.message);
+    if (!host) return rec;
+    host.innerHTML = `<div class="cb-recover${opts.inline ? ' inline' : ''}" role="alert" data-recover="${E(where || '')}">
+      <span class="cb-recover-ic">${icon('alert')}</span>
+      <div class="cb-recover-b">
+        <h3>This section hit a problem</h3>
+        <p>The rest of Callback is working and your data is safe.</p>
+        <code class="cb-recover-msg">${E(rec.message)}</code>
+        <div class="cb-recover-a">
+          <button type="button" class="btn btn-sm btn-primary" data-rc="reload">Reload section</button>
+          ${glOn() ? '<button type="button" class="btn btn-sm" data-rc="3d">Switch 3D off</button>' : ''}
+          <button type="button" class="btn btn-sm btn-ghost" data-rc="copy">Copy error</button>
+        </div>
+      </div>
+    </div>`;
+    const reload = () => { if (typeof opts.onReload === 'function') { try { opts.onReload(); } catch (e) { UI.recover(host, e, where, opts); } } else rerender(); };
+    host.querySelector('[data-rc="reload"]').onclick = reload;
+    host.querySelector('[data-rc="copy"]').onclick = () => UI.copy(errText(rec));
+    const b3 = host.querySelector('[data-rc="3d"]');
+    if (b3) b3.onclick = () => { UI.disable3D(); UI.toast('3D is off on this device. Views now use their flat versions.'); reload(); };
+    return rec;
+  };
+  /**
+   * Run fn() and show a recovery card in `host` if it throws (or its promise rejects).
+   * A function returned (or resolved) by fn is treated as a cleanup and handed to opts.cleanup.
+   */
+  UI.guard = (host, where, fn, opts = {}) => {
+    const keep = (c) => { if (typeof c === 'function') (opts.cleanup || ((f) => App.cleanup.push(f)))(c); };
+    try {
+      const r = fn();
+      if (r && typeof r.then === 'function') r.then(keep, (e) => { if (!host || host.isConnected) UI.recover(host, e, where, opts); });
+      else keep(r);
+    } catch (e) { UI.recover(host, e, where, opts); }
+  };
 
   // modal
   UI.modal = ({ title, body, foot, size, onMount, onClose, dismissable = true }) => {
@@ -218,60 +361,112 @@
   };
 
   // ───────────────────────── nav ─────────────────────────
+  const PINNED_TABS = ['dashboard', 'board', 'ats'];
   function renderNav() {
-    const jobs = S().ready ? S().list() : [];
-    const acts = S().ready ? CB.Auto.compute(jobs, S().settings, {}).filter((a) => a.sev === 1).length : 0;
-    const counts = { board: jobs.filter((j) => CB.STAGE[j.status].group === 'active').length, dashboard: acts };
-    let html = '', sec = '';
-    VIEWS.forEach((v) => {
-      if (v.sec !== sec) { sec = v.sec; html += `<div class="nav-sec">${E(sec)}</div>`; }
-      const n = counts[v.key];
-      html += `<a href="#${v.key}" ${App.current === v.key ? 'aria-current="page"' : ''}>${icon(v.icon)}<span>${E(v.label)}</span>${n ? `<span class="nav-count ${v.key === 'dashboard' ? 'hot' : ''}" title="${v.key === 'dashboard' ? 'Actions due' : 'Active applications'}">${n}</span>` : ''}</a>`;
-    });
-    $('#nav').innerHTML = html;
-    const tb = [['dashboard', 'Home', 'dashboard'], ['board', 'Pipeline', 'board'], ['add', '', 'plus'], ['ats', 'ATS', 'ats'], ['more', 'More', 'more']];
-    $('#tabbar').innerHTML = tb.map(([k, l, ic]) => k === 'add' ? `<button type="button" data-add aria-label="Add job"><span class="add-fab">${icon('plus')}</span></button>` : k === 'more' ? `<button type="button" data-more ${['sheet', 'calendar', 'inbox', 'reports', 'settings'].includes(App.current) ? 'aria-current="page"' : ''}>${icon(ic)}<span>${l}</span></button>` : `<a href="#${k}" ${App.current === k ? 'aria-current="page"' : ''}>${icon(ic)}<span>${l}</span></a>`).join('');
-    $('#tabbar [data-add]').onclick = () => UI.addJob();
-    $('#tabbar [data-more]').onclick = () => {
-      UI.modal({
-        title: 'More', size: 'sm',
-        body: `<div style="display:grid;gap:6px">${VIEWS.filter((v) => !['dashboard', 'board', 'ats'].includes(v.key)).map((v) => `<a class="btn" style="justify-content:flex-start" href="#${v.key}" data-go>${icon(v.icon)}<span>${E(v.label)}</span><span class="muted" style="margin-left:auto;font-weight:400;font-size:12px">${E(CRUMB[v.key])}</span></a>`).join('')}</div>`,
-        onMount: (m, api) => $$('[data-go]', m).forEach((a) => (a.onclick = () => api.close())),
-      });
-    };
-    // resume mini + sync
-    const r = S().resume;
-    const p = S().ready ? S().profile() : null;
-    const audit = p ? CB.ATS.auditResume(p, (r && r.warnings) || []) : null;
-    $('#resume-mini').innerHTML = audit ? `<span class="grade g-${audit.grade}">${audit.grade}</span><span style="min-width:0"><b class="ell" style="display:block;font-size:12.5px">${E(r.sample ? 'Example resume' : r.fileName || 'Resume')}</b><span class="muted" style="font-size:11.5px">${p.skills.size} skills · ${p.totalYears} yrs · score ${audit.score}</span></span>` : `<span class="grade g-none">?</span><span><b style="display:block;font-size:12.5px">No resume yet</b><span class="muted" style="font-size:11.5px">Upload to score every job</span></span>`;
-    const sy = $('#sync');
-    sy.className = 'sync ' + (S().mode === 'cloud' ? 'cloud' : S().mode === 'local' ? 'local' : '');
-    sy.querySelector('span').textContent = S().mode === 'cloud' ? (S().stale ? 'Sync slow — showing saved copy' : 'Synced across your devices') : S().mode === 'local' ? 'Saved on this device only' : 'Connecting…';
+    try { renderNavInner(); } catch (e) { CB.reportError(e, { where: 'nav', silent: true }); }
   }
+  function renderNavInner() {
+    const ready = S().ready;
+    const jobs = ready ? S().list() : [];
+    let acts = 0;
+    try { acts = ready && CB.Auto ? CB.Auto.compute(jobs, S().settings, {}).filter((a) => a.sev === 1).length : 0; } catch (e) { acts = 0; }
+    const counts = { board: jobs.filter((j) => CB.STAGE[j.status] && CB.STAGE[j.status].group === 'active').length, dashboard: acts };
+    let html = '';
+    SECS.forEach((sec) => {
+      const vs = VIEWS.filter((v) => v.sec === sec);
+      if (!vs.length) return;
+      html += `<div class="nav-sec">${E(sec)}</div>`;
+      vs.forEach((v) => {
+        const n = counts[v.key];
+        html += `<a href="#${E(v.key)}" data-view="${E(v.key)}" title="${E(v.label)}" ${App.current === v.key ? 'aria-current="page"' : ''}>${iconOr(v.icon)}<span>${E(v.label)}</span>${n ? `<span class="nav-count ${v.key === 'dashboard' ? 'hot' : ''}" title="${v.key === 'dashboard' ? 'Actions due' : 'Active applications'}">${n}</span>` : ''}</a>`;
+      });
+    });
+    const nav = $('#nav');
+    if (nav) nav.innerHTML = html;
+    const tabbar = $('#tabbar');
+    if (tabbar) {
+      const tb = [['dashboard', 'Home', 'dashboard'], ['board', 'Pipeline', 'board'], ['add', '', 'plus'], ['ats', 'ATS', 'ats'], ['more', 'More', 'more']];
+      const inMore = App.current && !PINNED_TABS.includes(App.current);
+      tabbar.innerHTML = tb.map(([k, l, ic]) => k === 'add' ? `<button type="button" data-add aria-label="Add job"><span class="add-fab">${icon('plus')}</span></button>` : k === 'more' ? `<button type="button" data-more ${inMore ? 'aria-current="page"' : ''}>${icon(ic)}<span>${l}</span></button>` : `<a href="#${k}" ${App.current === k ? 'aria-current="page"' : ''}>${icon(ic)}<span>${l}</span></a>`).join('');
+      $('[data-add]', tabbar).onclick = () => UI.addJob();
+      $('[data-more]', tabbar).onclick = () => UI.moreSheet();
+    }
+    // resume mini + sync
+    const rm = $('#resume-mini');
+    if (rm) {
+      const r = S().resume;
+      const p = ready ? S().profile() : null;
+      let audit = null;
+      try { audit = p && CB.ATS ? CB.ATS.auditResume(p, (r && r.warnings) || []) : null; } catch (e) { audit = null; }
+      rm.innerHTML = audit ? `<span class="grade g-${audit.grade}">${audit.grade}</span><span style="min-width:0"><b class="ell" style="display:block;font-size:12.5px">${E(r.sample ? 'Example resume' : r.fileName || 'Resume')}</b><span class="muted" style="font-size:11.5px">${p.skills.size} skills · ${p.totalYears} yrs · score ${audit.score}</span></span>` : `<span class="grade g-none">?</span><span><b style="display:block;font-size:12.5px">No resume yet</b><span class="muted" style="font-size:11.5px">Upload to score every job</span></span>`;
+    }
+    const sy = $('#sync');
+    if (sy) {
+      sy.className = 'sync ' + (S().mode === 'cloud' ? 'cloud' : S().mode === 'local' ? 'local' : '');
+      const sp = sy.querySelector('span');
+      if (sp) sp.textContent = !CB.Store ? 'Data engine unavailable' : S().mode === 'cloud' ? (S().stale ? 'Sync slow — showing saved copy' : 'Synced across your devices') : S().mode === 'local' ? 'Saved on this device only' : 'Connecting…';
+    }
+  }
+  /** iPhone tab bar "More": every view that is not pinned to the bar, grouped by section. */
+  UI.moreSheet = () => {
+    let html = '<div class="more-list">', sec = '';
+    VIEWS.filter((v) => !PINNED_TABS.includes(v.key)).forEach((v) => {
+      if (v.sec !== sec) { sec = v.sec; html += `<div class="more-sec">${E(sec)}</div>`; }
+      const c = crumbFor(v);
+      html += `<a class="more-item" href="#${E(v.key)}" data-go="${E(v.key)}" ${App.current === v.key ? 'aria-current="page"' : ''}><span class="more-ic">${iconOr(v.icon)}</span><span class="more-t"><b>${E(v.label)}</b>${c ? `<small>${E(c)}</small>` : ''}</span></a>`;
+    });
+    UI.modal({ title: 'More', size: 'sm', body: html + '</div>', onMount: (m, api) => $$('[data-go]', m).forEach((a) => (a.onclick = () => api.close())) });
+  };
 
   // ───────────────────────── routing ─────────────────────────
-  function teardown() { App.cleanup.forEach((f) => { try { f(); } catch (e) { /* noop */ } }); App.cleanup = []; CB.Charts.tip.hide(); }
-  function route() {
-    const k = (location.hash || '').slice(1);
-    const v = VIEWS.find((x) => x.key === k) ? k : 'dashboard';
-    show(v);
+  function teardown() {
+    App.cleanup.forEach((f) => { try { f(); } catch (e) { CB.reportError(e, { where: 'cleanup', silent: true }); } });
+    App.cleanup = [];
+    try { if (CB.Charts && CB.Charts.tip) CB.Charts.tip.hide(); } catch (e) { /* noop */ }
   }
+  function route() {
+    let k = (location.hash || '').slice(1);
+    try { k = decodeURIComponent(k); } catch (e) { /* keep raw */ }
+    App.wanted = k;
+    show(viewMeta(k) ? k : 'dashboard');
+  }
+  const setText = (sel, t) => { const el = $(sel); if (el) el.textContent = t; };
   function show(k, refresh) {
     const view = $('#view');
+    const meta = viewMeta(k) || viewMeta('dashboard');
+    k = meta.key;
     const keepScroll = refresh ? window.scrollY : 0;
     App.next = k;
     if (!refresh) teardown();
     App.current = k;
-    const meta = VIEWS.find((x) => x.key === k);
-    $('#page-title').textContent = meta.label;
-    $('#page-crumb').textContent = CRUMB[k] || '';
+    setText('#page-title', meta.label);
+    setText('#page-crumb', crumbFor(meta));
     document.title = meta.label + ' · Callback';
     renderNav();
-    if (!S().ready) { view.innerHTML = `<div class="empty"><span class="thinking">Loading your applications…</span><p class="muted" style="max-width:46ch">Your data syncs between your iPhone and MacBook. If this takes more than a few seconds, the saved copy will open.</p></div>`; return; }
+    if (!view) return;
+    if (!CB.Store) {
+      UI.recover(view, Object.assign(new Error('The data engine (js/store.js) did not load. Reload to try again.'), { cbLoad: true }), 'store', { onReload: () => location.reload() });
+      if (!refresh) CB.emit('route', k);
+      return;
+    }
+    if (!S().ready) {
+      view.innerHTML = `<div class="skel-wrap" aria-busy="true" aria-label="Loading your applications"><div class="skel" style="height:118px"></div><div class="dash"><div class="skel span-7" style="height:380px"></div><div class="skel span-5" style="height:380px"></div></div><p class="muted" style="font-size:12.5px;margin:0">Loading your applications. Your data syncs between your iPhone and MacBook; if this takes more than a few seconds, the saved copy opens.</p></div>`;
+      if (!refresh) CB.emit('route', k);
+      return;
+    }
     if (refresh) teardown();
-    try { CB.Views[k](view, { refresh }); }
-    catch (e) { console.error(e); view.innerHTML = `<div class="empty"><h3>Something went wrong drawing this view</h3><p class="muted">${E(e.message)}</p></div>`; }
+    const opts = {
+      refresh: !!refresh,
+      cleanup: (fn) => { if (typeof fn === 'function') App.cleanup.push(fn); },
+      onLeave: (fn) => { if (typeof fn === 'function') App.cleanup.push(() => { if (App.next !== k) fn(); }); },
+    };
+    UI.guard(view, 'view:' + k, () => {
+      if (meta.reg) return meta.reg.render(view, opts);
+      if (!CB.Views || typeof CB.Views[k] !== 'function') throw Object.assign(new Error(`The ${meta.label} view did not load (js/views.js).`), { cbLoad: true });
+      return CB.Views[k](view, opts);
+    }, { onReload: () => show(k) });
     if (refresh) window.scrollTo(0, keepScroll); else window.scrollTo(0, 0);
+    if (!refresh) CB.emit('route', k);
   }
   const rerender = CB.debounce(() => {
     if (App.busy) { rerender(); return; }
@@ -280,10 +475,21 @@
   }, 140);
   App.rerender = rerender;
 
+  // Registry changes after boot: rebuild nav, follow a deep link to a late view, refresh cards and tabs.
+  const onRegistry = CB.debounce(() => {
+    buildViews();
+    if (!App.booted) return;
+    if (App.wanted && App.wanted !== App.current && viewMeta(App.wanted)) { route(); return; }
+    if (App.current && !viewMeta(App.current)) { route(); return; }
+    renderNav();
+    rerender();
+  }, 30);
+  CB.on('registry', onRegistry);
+
   // ───────────────────────── theme ─────────────────────────
   function applyTheme() {
     let t = 'system';
-    try { t = localStorage.getItem('callback.theme') || 'system'; } catch (e) { /* noop */ }
+    try { t = localStorage.getItem('callback.theme') || 'dark'; } catch (e) { t = 'dark'; } // Obsidian & Champagne is the default
     if (t === 'system') document.documentElement.removeAttribute('data-theme');
     else document.documentElement.setAttribute('data-theme', t);
   }
@@ -338,12 +544,22 @@
     scrim.onclick = () => Drawer.close();
     Drawer.render();
   };
+  const runDrawerCleanup = () => {
+    if (Drawer._cleanup) Drawer._cleanup.forEach((f) => { try { f(); } catch (e) { CB.reportError(e, { where: 'drawer:cleanup', silent: true }); } });
+    Drawer._cleanup = [];
+  };
   Drawer.close = (silent) => {
     $('#drawer') && $('#drawer').remove();
     $('#dr-scrim') && $('#dr-scrim').remove();
-    if (Drawer._cleanup) { Drawer._cleanup.forEach((f) => f()); Drawer._cleanup = []; }
+    runDrawerCleanup();
     if (!silent) App.drawerId = null;
   };
+  /** Registered drawer tabs (after the built-ins) and header actions. */
+  const extTabs = () => reg('drawerTabs').filter((t) => {
+    if (BUILTIN_TABS.includes(t.key)) { warnOnce(`registerDrawerTab: "${t.key}" is a built-in tab; ignored.`); return false; }
+    return true;
+  });
+  const extTabLabel = (t, j) => { try { return String((typeof t.label === 'function' ? t.label(j) : t.label) || t.key); } catch (e) { return t.key; } };
   Drawer.refresh = () => {
     const d = $('#drawer');
     if (!d) return;
@@ -355,16 +571,32 @@
     const d = $('#drawer');
     const j = S().get(App.drawerId);
     if (!d || !j) return;
+    const head = d.querySelector('.dr-head');
+    if (!head) return;
+    try { renderHeadInner(d, j, head); }
+    catch (e) {
+      // Minimal header so the drawer can always be closed and its tabs used.
+      CB.reportError(e, { where: 'drawer:head', silent: true });
+      head.innerHTML = `<div class="dr-title"><div style="min-width:0"><h2>${E(j.title || 'Untitled role')}</h2><div class="co">${E(j.company || 'Company')}</div></div>
+        <div class="row" style="gap:4px;flex-wrap:nowrap"><button class="btn btn-ghost btn-icon" data-close title="Close" aria-label="Close">${icon('x')}</button></div></div>
+        <div class="dr-tabs" role="tablist">${BUILTIN_TABS.map((k) => `<button role="tab" data-tab="${k}" aria-selected="${App.drawerTab === k}">${E(k.charAt(0).toUpperCase() + k.slice(1))}</button>`).join('')}${extTabs().map((t) => `<button role="tab" data-tab="${E(t.key)}" aria-selected="${App.drawerTab === t.key}">${E(extTabLabel(t, j))}</button>`).join('')}</div>`;
+      head.querySelector('[data-close]').onclick = () => Drawer.close();
+      $$('[data-tab]', head).forEach((b) => (b.onclick = () => { App.drawerTab = b.dataset.tab; Drawer.render(); }));
+    }
+  };
+  function renderHeadInner(d, j, head) {
     const a = S().atsFor(j);
     const st = CB.STAGE[j.status];
-    const head = d.querySelector('.dr-head');
-    const tabs = [['overview', 'Overview'], ['ats', 'ATS report'], ['interviews', `Interviews${j.interviews.length ? ' · ' + j.interviews.length : ''}`], ['contacts', `Contacts${j.contacts.length ? ' · ' + j.contacts.length : ''}`], ['docs', 'Notes & docs'], ['timeline', 'Timeline']];
+    const tabs = [['overview', 'Overview'], ['ats', 'ATS report'], ['interviews', `Interviews${j.interviews.length ? ' · ' + j.interviews.length : ''}`], ['contacts', `Contacts${j.contacts.length ? ' · ' + j.contacts.length : ''}`], ['docs', 'Notes & docs'], ['timeline', 'Timeline']]
+      .concat(extTabs().map((t) => [t.key, extTabLabel(t, j)]));
+    const acts = reg('drawerActions');
     head.innerHTML = `
       <div class="dr-title">${UI.mono(j.company, 44)}
         <div style="min-width:0"><h2>${E(j.title || 'Untitled role')}</h2><div class="co">${E(j.company || 'Company')}${j.location ? ' · ' + E(j.location) : ''}${j.sample ? ' <span class="example-dot">Example</span>' : ''}</div></div>
         <div class="row" style="gap:4px;flex-wrap:nowrap">
           ${j.url ? `<a class="btn btn-ghost btn-icon" href="${E(j.url)}" target="_blank" rel="noopener" title="Open posting">${icon('link')}</a>` : ''}
           <button class="btn btn-ghost btn-icon" data-dossier title="Export dossier (.docx)">${icon('doc')}</button>
+          ${acts.map((x) => `<button class="btn btn-ghost btn-icon" data-dra="${E(x.key)}" title="${E(x.title)}" aria-label="${E(x.title)}">${iconOr(x.icon)}</button>`).join('')}
           <button class="btn btn-ghost btn-icon" data-del title="Delete">${icon('trash')}</button>
           <button class="btn btn-ghost btn-icon" data-close title="Close" aria-label="Close">${icon('x')}</button>
         </div>
@@ -377,26 +609,36 @@
         ${CB.fmtSalary(j) ? `<span class="tag">${E(CB.fmtSalary(j))}</span>` : ''}
       </div>
       <div class="stepper" aria-hidden="true">${CB.PROGRESSION.filter((s) => s.key !== 'saved').map((s) => `<i class="${(j.maxStage || 0) >= s.order ? 'on' : ''}" style="--c:var(--st-${st.group === 'closed' ? j.status : s.key})" title="${E(s.label)}"></i>`).join('')}</div>
-      <div class="dr-tabs" role="tablist">${tabs.map(([k, l]) => `<button role="tab" data-tab="${k}" aria-selected="${App.drawerTab === k}">${E(l)}</button>`).join('')}</div>`;
+      <div class="dr-tabs" role="tablist">${tabs.map(([k, l]) => `<button role="tab" data-tab="${E(k)}" aria-selected="${App.drawerTab === k}">${E(l)}</button>`).join('')}</div>`;
     head.querySelector('[data-close]').onclick = () => Drawer.close();
     head.querySelector('#dr-status').onchange = (e) => UI.moveJob(j.id, e.target.value);
     head.querySelector('[data-del]').onclick = async () => {
       if (await UI.confirm({ title: 'Delete application?', text: `${j.company} · ${j.title} and its interviews, contacts and notes will be removed. You can undo right after.`, ok: 'Delete', danger: true })) { S().remove(j.id); Drawer.close(); UI.toast('Deleted', { undo: true }); }
     };
-    head.querySelector('[data-dossier]').onclick = () => UI.save(CB.IO.exportJobDossierDocx(j, a, S().resume && S().resume.fileName), 'Dossier ready');
+    head.querySelector('[data-dossier]').onclick = () => { if (!CB.IO) { UI.toast('Exports are unavailable right now.', { tone: 'warn' }); return; } UI.save(CB.IO.exportJobDossierDocx(j, a, S().resume && S().resume.fileName), 'Dossier ready'); };
+    $$('[data-dra]', head).forEach((b) => (b.onclick = () => {
+      const x = acts.find((y) => y.key === b.dataset.dra);
+      const cur = S().get(j.id);
+      if (!x || !cur) return;
+      try { const r = x.run(cur); if (r && typeof r.then === 'function') r.then(null, (e) => CB.reportError(e, { where: 'drawer-action:' + x.key })); }
+      catch (e) { CB.reportError(e, { where: 'drawer-action:' + x.key }); }
+    }));
     $$('[data-tab]', head).forEach((b) => (b.onclick = () => { App.drawerTab = b.dataset.tab; Drawer.render(); }));
-  };
+  }
   Drawer.render = (keepScroll) => {
     const d = $('#drawer');
     const j = S().get(App.drawerId);
     if (!d || !j) return;
     const prevScroll = keepScroll && d.querySelector('.dr-body') ? d.querySelector('.dr-body').scrollTop : 0;
-    if (Drawer._cleanup) { Drawer._cleanup.forEach((f) => f()); }
-    Drawer._cleanup = [];
+    runDrawerCleanup();
+    const ext = !Tabs[App.drawerTab] && extTabs().find((t) => t.key === App.drawerTab);
+    if (!Tabs[App.drawerTab] && !ext) App.drawerTab = 'overview';
     d.innerHTML = `<div class="dr-head"></div><div class="dr-body" id="dr-body"></div>`;
     Drawer.renderHead();
     const body = d.querySelector('.dr-body');
-    (Tabs[App.drawerTab] || Tabs.overview)(body, j);
+    const tab = App.drawerTab;
+    const ctx = { cleanup: (fn) => { if (typeof fn === 'function') Drawer._cleanup.push(fn); }, refresh: () => Drawer.render(true) };
+    UI.guard(body, 'drawer:' + tab, () => (ext ? ext.render(body, j, ctx) : Tabs[tab](body, j)), { inline: true, cleanup: ctx.cleanup, onReload: () => Drawer.render(true) });
     if (keepScroll) body.scrollTop = prevScroll;
     d.onkeydown = (e) => { if (e.key === 'Escape' && !$('.modal')) Drawer.close(); };
   };
@@ -806,36 +1048,44 @@
     scrim.style.zIndex = 90;
     const p = document.createElement('div');
     p.className = 'palette';
-    p.innerHTML = `<input id="pal-q" placeholder="Search applications or type a command…" autocomplete="off" aria-label="Search"><div class="pal-list" id="pal-list" role="listbox"></div>`;
+    p.innerHTML = `<input id="pal-q" placeholder="Search applications or type a command…" autocomplete="off" aria-label="Search"><div class="pal-list" id="pal-list" role="listbox"></div><div class="pal-foot" aria-hidden="true"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span><span><kbd>esc</kbd> Close</span></div>`;
     document.body.append(scrim, p);
     const close = () => { scrim.remove(); p.remove(); };
     scrim.onclick = close;
+    const exportData = () => ({ jobs: S().list(), atsById: S().atsMap(), stats: CB.Stats.compute(S().list(), S().atsMap()), resumeName: S().resume && S().resume.fileName });
     const cmds = [
-      ...VIEWS.map((v, i) => ({ label: 'Go to ' + v.label, k: String(i + 1), run: () => (location.hash = v.key) })),
+      ...VIEWS.map((v, i) => ({ label: 'Go to ' + v.label, k: i < 8 ? String(i + 1) : '', run: () => (location.hash = v.key) })),
       { label: 'Ask Cal (assistant)', k: 'C', run: () => CB.Cal && CB.Cal.open() },
       { label: 'Add application', k: 'N', run: () => UI.addJob() },
       { label: 'Upload resume', run: () => { location.hash = 'ats'; setTimeout(() => $('#rs-file') && $('#rs-file').click(), 200); } },
-      { label: 'Export Excel workbook', run: () => UI.save(CB.IO.exportExcel({ jobs: S().list(), atsById: S().atsMap(), stats: CB.Stats.compute(S().list(), S().atsMap()), resumeName: S().resume && S().resume.fileName }), 'Workbook ready') },
-      { label: 'Export Word report', run: () => UI.save(CB.IO.exportReportDocx({ jobs: S().list(), atsById: S().atsMap(), stats: CB.Stats.compute(S().list(), S().atsMap()), resumeName: S().resume && S().resume.fileName }), 'Report ready') },
+      { label: 'Export Excel workbook', run: () => UI.save(CB.IO.exportExcel(exportData()), 'Workbook ready') },
+      { label: 'Export Word report', run: () => UI.save(CB.IO.exportReportDocx(exportData()), 'Report ready') },
       { label: 'Toggle dark / light', run: () => UI.setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark') },
       { label: 'Undo last change', k: '⌘Z', run: () => { const u = S().undo(); UI.toast(u ? 'Undone' : 'Nothing to undo'); } },
+      ...reg('commands').map((c) => ({ label: c.label, k: c.k, run: c.run, where: 'command:' + c.label })),
     ];
+    // Every command runs guarded: a failing command shows the error toast, never a dead palette.
+    const runCmd = (c) => {
+      try { const r = c.run(); if (r && typeof r.then === 'function') r.then(null, (e) => CB.reportError(e, { where: c.where || 'command' })); }
+      catch (e) { CB.reportError(e, { where: c.where || 'command' }); }
+    };
     let sel = 0, items = [];
     const draw = () => {
       const q = $('#pal-q', p).value.trim().toLowerCase();
       const jobs = S().list().filter((j) => !q || `${j.company} ${j.title} ${j.location} ${CB.STAGE[j.status].label}`.toLowerCase().includes(q)).slice(0, 8).map((j) => ({ job: j, label: `${j.company} · ${j.title}`, run: () => UI.openJob(j.id) }));
+      jobs.forEach((x) => (x.where = 'palette:open'));
       const cs = cmds.filter((c) => !q || c.label.toLowerCase().includes(q));
       items = [...jobs, ...cs];
       sel = Math.min(sel, Math.max(0, items.length - 1));
       $('#pal-list', p).innerHTML = (jobs.length ? '<div class="pal-sec">Applications</div>' : '') + jobs.map((it, i) => `<div class="pal-item" role="option" data-i="${i}" aria-selected="${i === sel}">${UI.mono(it.job.company, 26)}<span class="ell">${E(it.label)}</span><span class="k">${UI.chip(it.job.status)}</span></div>`).join('') + (cs.length ? '<div class="pal-sec">Commands</div>' : '') + cs.map((c, k) => { const i = jobs.length + k; return `<div class="pal-item" role="option" data-i="${i}" aria-selected="${i === sel}"><span>${E(c.label)}</span>${c.k ? `<span class="k"><kbd>${E(c.k)}</kbd></span>` : ''}</div>`; }).join('') || '<div class="pal-item muted">No matches</div>';
-      $$('.pal-item[data-i]', p).forEach((n) => (n.onclick = () => { close(); items[+n.dataset.i].run(); }));
+      $$('.pal-item[data-i]', p).forEach((n) => (n.onclick = () => { close(); runCmd(items[+n.dataset.i]); }));
     };
     const q = $('#pal-q', p);
     q.oninput = () => { sel = 0; draw(); };
     q.onkeydown = (e) => {
       if (e.key === 'ArrowDown') { sel = Math.min(items.length - 1, sel + 1); draw(); e.preventDefault(); }
       else if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); }
-      else if (e.key === 'Enter') { const it = items[sel]; close(); it && it.run(); }
+      else if (e.key === 'Enter') { const it = items[sel]; close(); if (it) runCmd(it); }
       else if (e.key === 'Escape') close();
     };
     draw();
@@ -851,31 +1101,135 @@
     if (e.key === 'n' || e.key === 'N') { e.preventDefault(); UI.addJob(); }
     else if ((e.key === 'c' || e.key === 'C') && CB.Cal) { e.preventDefault(); CB.Cal.show(true); CB.Cal.open(); }
     else if (e.key === '/') { e.preventDefault(); UI.palette(); }
-    else if (/^[1-8]$/.test(e.key) && !$('#drawer')) { location.hash = VIEWS[+e.key - 1].key; }
+    else if (/^[1-8]$/.test(e.key) && !$('#drawer')) { const v = VIEWS[+e.key - 1]; if (v) location.hash = v.key; }
     else if (e.key === 'Escape' && $('#drawer')) Drawer.close();
   });
 
+  // ───────────────────────── extension mount points (called from views.js) ─────────────────────────
+  /**
+   * Dashboard: render registered dash cards (CB.registerDashCard) right after `anchor` (the KPI row).
+   * If the anchor is not inside a `.dash` grid (empty state), the cards get their own grid after it.
+   * Each card is guarded: a failing card shows its own recovery card, the rest of the dashboard is untouched.
+   */
+  UI.mountDashCards = (anchor, ctx = {}) => {
+    const cards = reg('dashCards');
+    if (!cards.length || !anchor || !anchor.parentNode) return;
+    let parent = anchor.parentNode;
+    let ref = anchor.nextSibling;
+    if (!(parent.classList && parent.classList.contains('dash'))) {
+      const grid = document.createElement('div');
+      grid.className = 'dash dash-ext';
+      parent.insertBefore(grid, ref);
+      parent = grid;
+      ref = null;
+    }
+    const c = Object.assign({}, ctx, { cleanup: (fn) => { if (typeof fn === 'function') App.cleanup.push(fn); } });
+    cards.forEach((d) => {
+      const sec = document.createElement('section');
+      sec.className = `card span-${d.span} ext-card`;
+      sec.setAttribute('data-dash', d.key);
+      let sub = '';
+      try { sub = typeof d.sub === 'function' ? d.sub(ctx) : d.sub; } catch (e) { sub = ''; }
+      sec.innerHTML = (d.title || sub ? `<div class="card-h">${d.title ? `<h3>${E(d.title)}</h3>` : ''}${sub ? `<span class="sub">${E(sub)}</span>` : ''}</div>` : '') + '<div class="ext-body"></div>';
+      parent.insertBefore(sec, ref);
+      const body = sec.querySelector('.ext-body');
+      const draw = () => { body.innerHTML = ''; UI.guard(body, 'dash:' + d.key, () => d.render(body, c), { inline: true, onReload: draw }); };
+      draw();
+    });
+  };
+  /** Settings: append registered settings cards (CB.registerSettings) to the settings grid. */
+  UI.mountSettingsCards = (grid) => {
+    const cards = reg('settings');
+    grid = grid || $('#view');
+    if (!cards.length || !grid) return;
+    cards.forEach((d) => {
+      const sec = document.createElement('section');
+      sec.className = `card span-${d.span} ext-card`;
+      sec.setAttribute('data-settings', d.key);
+      sec.innerHTML = (d.title ? `<div class="card-h"><h3>${E(d.title)}</h3></div>` : '') + '<div class="ext-body"></div>';
+      grid.appendChild(sec);
+      const body = sec.querySelector('.ext-body');
+      const draw = () => { body.innerHTML = ''; UI.guard(body, 'settings:' + d.key, () => d.render(body), { inline: true, onReload: draw }); };
+      draw();
+    });
+  };
+  /** Action Center: run a registered action item ({action:{run(item)}}). */
+  UI.runCustomAction = (a) => {
+    if (!a || !a.action || typeof a.action.run !== 'function') return;
+    try { const r = a.action.run(a); if (r && typeof r.then === 'function') r.then(null, (e) => CB.reportError(e, { where: 'action:' + a.id })); }
+    catch (e) { CB.reportError(e, { where: 'action:' + a.id }); }
+  };
+
+  // ───────────────────────── platform styles (new elements only; tokens with v2 fallbacks) ─────────────────────────
+  const PLATFORM_CSS = `
+.cb-recover{display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start;max-width:620px;margin:32px auto;padding:20px;border-radius:var(--r-md,12px);background:var(--surface-1,var(--surface));border:1px solid var(--line-2);box-shadow:inset 0 1px 0 var(--rim,transparent);text-align:left}
+.cb-recover.inline{margin:0;max-width:none;padding:14px;background:var(--surface-2,var(--sunken))}
+.cb-recover-ic{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;color:var(--warning,var(--warn));background:color-mix(in srgb,var(--warning,var(--warn)) 14%,transparent);border:1px solid color-mix(in srgb,var(--warning,var(--warn)) 35%,transparent)}
+.cb-recover-ic svg{width:17px;height:17px}
+.cb-recover-b{min-width:0}
+.cb-recover h3{margin:2px 0 4px;font:600 15px/1.35 var(--f-ui);color:var(--ink-1,var(--ink))}
+.cb-recover p{margin:0 0 10px;font-size:13px;color:var(--ink-3,var(--muted))}
+.cb-recover-msg{display:block;margin:0 0 14px;padding:8px 10px;border-radius:var(--r-sm,8px);background:var(--surface-2,var(--sunken));border:1px solid var(--line-1,var(--line));font:500 12px/1.45 var(--f-mono);color:var(--ink-2);white-space:pre-wrap;word-break:break-word;max-height:7.5em;overflow:auto}
+.cb-recover.inline .cb-recover-msg{background:var(--surface-1,var(--surface))}
+.cb-recover-a{display:flex;flex-wrap:wrap;gap:8px}
+.cb-err-pre{margin:0;max-height:min(46vh,360px);overflow:auto;padding:12px;border-radius:var(--r-sm,8px);background:var(--surface-2,var(--sunken));border:1px solid var(--line-1,var(--line));font:500 11.5px/1.5 var(--f-mono);color:var(--ink-2);white-space:pre-wrap;word-break:break-word;user-select:text;-webkit-user-select:text}
+.toast.err{gap:10px}
+.toast.err::before{content:"";flex:none;width:7px;height:7px;border-radius:50%;background:var(--danger,var(--bad));box-shadow:0 0 0 3px color-mix(in srgb,var(--danger,var(--bad)) 25%,transparent)}
+.more-list{display:grid;gap:2px}
+.more-sec{padding:12px 4px 6px;font:500 10.5px/14px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3,var(--muted))}
+.more-sec:first-child{padding-top:0}
+.more-item{display:grid;grid-template-columns:36px minmax(0,1fr);gap:12px;align-items:center;min-height:52px;padding:8px 10px;border-radius:var(--r-sm,8px);color:var(--ink-1,var(--ink));text-decoration:none}
+.more-item:hover,.more-item[aria-current="page"]{background:var(--surface-2,var(--sunken))}
+.more-ic{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;background:var(--surface-2,var(--sunken));border:1px solid var(--line-1,var(--line));color:var(--ink-2)}
+.more-item[aria-current="page"] .more-ic{color:var(--gold-300,var(--accent-strong));border-color:var(--gold-line,var(--line-2))}
+.more-ic svg{width:18px;height:18px}
+.more-t{min-width:0;display:grid;gap:1px}
+.more-t b{font-weight:560;font-size:14.5px}
+.more-t small{font-size:12px;color:var(--ink-3,var(--muted));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dash-ext{margin-top:16px}
+`;
+
   // ───────────────────────── boot ─────────────────────────
   async function boot() {
-    applyTheme();
-    $('#add-job').onclick = () => UI.addJob();
-    $('#open-palette').onclick = () => UI.palette();
+    try { CB.css('platform', PLATFORM_CSS); } catch (e) { /* noop */ }
+    try { applyTheme(); } catch (e) { /* noop */ }
+    toastHost();
+    const addBtn = $('#add-job');
+    if (addBtn) addBtn.onclick = () => UI.addJob();
+    const palBtn = $('#open-palette');
+    if (palBtn) palBtn.onclick = () => UI.palette();
     window.addEventListener('hashchange', route);
+    buildViews();
     route();
-    CB.AI.get().then((s) => { App.ai = !!s; if (App.ai && S().ready) rerender(); });
+    try { if (CB.AI && CB.AI.get) CB.AI.get().then((s) => { App.ai = !!s; if (App.ai && S().ready) rerender(); }, () => {}); } catch (e) { /* noop */ }
     CB.on('ai:off', () => { App.ai = false; rerender(); });
-    await S().init();
+    try { await S().init(); } catch (e) { CB.reportError(e, { where: 'store:init' }); }
     CB.on('data', () => rerender());
+    App.booted = true;
     route();
-    try { if (CB.Cal) CB.Cal.mount(); } catch (e) { console.error('Cal', e); }
+    try { if (CB.Cal && CB.Store) CB.Cal.mount(); } catch (e) { CB.reportError(e, { where: 'cal:mount', silent: true }); }
+    // Problems that happened while loading: one toast for all of them.
+    const early = (CB.errors || []).filter((r) => !r.silent);
+    if (early.length) {
+      const list = early;
+      const load = list.filter((r) => r.kind === 'load');
+      ERR.last = Date.now();
+      list.forEach((r) => ERR.seen.set(r.kind + '|' + r.message, Date.now()));
+      const msg = load.length === list.length
+        ? (load.length === 1 ? load[0].message : `${load.length} parts of Callback did not load (${(CB._loadFailures || []).join(', ')}). Everything else keeps working.`)
+        : list.length === 1 ? 'Something went wrong while loading, but Callback kept running.' : `${list.length} problems occurred while loading. Callback kept running.`;
+      UI.toast(msg, { tone: 'err', ms: 9000, action: { label: 'Details', run: () => UI.errorDetails(list[list.length - 1]) } });
+    }
     let lastW = window.innerWidth;
     window.addEventListener('resize', CB.debounce(() => { if (Math.abs(window.innerWidth - lastW) > 40) { lastW = window.innerWidth; rerender(); } }, 250));
     document.addEventListener('visibilitychange', () => { if (!document.hidden && App.current === 'dashboard') rerender(); });
   }
 
+  UI.ICONS = ICON;
   CB.UI = UI;
   CB.App = App;
   CB.Drawer = Drawer;
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => setTimeout(boot, 0));
-  else setTimeout(boot, 0);
+  const start = () => setTimeout(() => boot().catch((e) => CB.reportError(e, { where: 'boot' })), 0);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
 })();

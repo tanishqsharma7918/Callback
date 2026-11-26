@@ -61,30 +61,67 @@
     if (S.mode === 'cloud') { pending.set(path, body); flush(path); }
     else saveLocal();
   }
+  const isQuota = (e) => !!e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || e.code === 22 || e.code === 1014);
+  let lastStorageToast = 0;
+  /** One toast per 20 s about local storage trouble, with a one-tap backup. */
+  function storageToast(e) {
+    if (Date.now() - lastStorageToast < 20000) return;
+    lastStorageToast = Date.now();
+    const text = isQuota(e)
+      ? 'Storage on this device is full, so your latest change was not saved. Export a backup now, then clear examples or old applications.'
+      : 'This browser refused to save (private browsing or blocked storage). Export a backup to keep your data.';
+    CB.emit('toast', { text, tone: 'bad', ms: 12000, action: { label: 'Export backup', run: exportBackup } });
+  }
+  function exportBackup() {
+    try {
+      const p = CB.IO.exportJSON({ jobs: list(), resume: S.resume, settings: S.settings });
+      if (CB.UI && CB.UI.save) CB.UI.save(p, 'Backup ready');
+    } catch (e) { CB.emit('toast', { text: 'The backup could not be created here. Open Reports & Export and try again.', tone: 'bad' }); }
+  }
   const saveLocal = CB.debounce(() => {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({ jobs: [...S.jobs.values()], resume: S.resume, settings: S.settings }));
-    } catch (e) {
-      CB.emit('toast', { text: 'This browser refused to save (private mode or storage full). Export a backup to keep your data.', tone: 'bad' });
-    }
+    } catch (e) { storageToast(e); }
   }, 250);
+  /** Normalize every stored job (old versions, partial imports) so views never meet a missing field. */
+  function jobsMap(arr) {
+    const m = new Map();
+    (Array.isArray(arr) ? arr : []).forEach((raw) => { const j = CB.normalizeJob(raw); if (j) m.set(j.id, j); });
+    return m;
+  }
   function loadLocal() {
+    let raw = null;
+    try { raw = localStorage.getItem(LS_KEY); } catch (e) { return false; }
+    if (!raw) return false;
     try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (!raw) return false;
       const d = JSON.parse(raw);
-      S.jobs = new Map((d.jobs || []).map((j) => [j.id, j]));
-      S.resume = d.resume || null;
-      S.settings = { ...DEFAULT_SETTINGS, ...(d.settings || {}) };
+      if (!d || typeof d !== 'object') throw new Error('not an object');
+      S.jobs = jobsMap(d.jobs);
+      S.resume = d.resume && typeof d.resume === 'object' ? d.resume : null;
+      S.settings = { ...DEFAULT_SETTINGS, ...(d.settings && typeof d.settings === 'object' ? d.settings : {}) };
       return true;
-    } catch (e) { return false; }
+    } catch (e) {
+      // Keep the unreadable copy instead of overwriting it with examples.
+      try { localStorage.setItem(LS_KEY + '.unreadable', raw); } catch (x) { /* storage full */ }
+      CB.reportError(e, { where: 'store:loadLocal', silent: true });
+      CB.emit('toast', { text: 'Your saved data could not be read, so a copy was kept aside and Callback started fresh. Restore a backup from Reports & Export if you have one.', tone: 'warn', ms: 12000 });
+      return false;
+    }
   }
 
   async function init() {
+    try { await initInner(); }
+    catch (e) {
+      CB.reportError(e, { where: 'store:init' });
+      if (!S.ready) { S.mode = 'local'; db = null; try { loadLocal() || seedLocal(); } catch (x) { /* noop */ } S.ready = true; emit('init', { fallback: true }); }
+    }
+    bindKv();
+  }
+  async function initInner() {
     db = await CB.cap('db');
     if (!db) {
       S.mode = 'local';
-      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* noop */ }
+      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* noop */ }
       const had = loadLocal();
       if (!had) seedLocal();
       S.ready = true;
@@ -108,7 +145,7 @@
     try {
       db.collection('jobs').onSnapshot((snap) => {
         const m = new Map();
-        snap.docs.forEach((d) => { const v = d.data(); if (v) m.set(d.id, v); });
+        snap.docs.forEach((d) => { const v = CB.normalizeJob(d.data()); if (v) m.set(d.id, Object.assign(v, { id: d.id })); });
         // keep local optimistic edits that haven't round-tripped
         for (const [path, body] of pending) { const id = path.split('/')[1]; if (path.startsWith('jobs/')) body === null ? m.delete(id) : m.set(id, body); }
         S.jobs = m;
@@ -123,7 +160,7 @@
         S.ready ? emit('remote') : check();
       }, onErr);
       db.doc('profile/settings').onSnapshot((d) => {
-        S.settings = { ...DEFAULT_SETTINGS, ...(d.exists ? d.data() : {}) };
+        S.settings = { ...DEFAULT_SETTINGS, ...(d.exists && d.data() ? d.data() : {}) };
         gotSettings = true;
         S.ready ? emit('remote') : check();
       }, onErr);
@@ -133,11 +170,12 @@
   }
   function seedLocal() {
     // Standalone/offline use: start with clearly-marked example data.
-    if (CB.Samples) {
-      CB.Samples.jobs().forEach((j) => S.jobs.set(j.id, j));
+    if (!CB.Samples) return;
+    try {
+      CB.Samples.jobs().forEach((raw) => { const j = CB.normalizeJob(raw); if (j) S.jobs.set(j.id, j); });
       S.resume = CB.Samples.resume();
       saveLocal();
-    }
+    } catch (e) { CB.reportError(e, { where: 'store:samples', silent: true }); }
   }
 
   // ─────────── job CRUD ───────────
@@ -258,7 +296,7 @@
     let added = 0, updated = 0;
     const existing = list();
     for (const raw of jobs) {
-      const j = CB.newJob(raw);
+      const j = CB.normalizeJob(CB.newJob(raw)) || CB.newJob();
       const dup = existing.find((e) => (j.linkedinJobId && e.linkedinJobId === j.linkedinJobId) || (e.company && e.title && e.company.toLowerCase() === (j.company || '').toLowerCase() && e.title.toLowerCase() === (j.title || '').toLowerCase()));
       if (dup && mode === 'merge') {
         const m = { ...clone(dup), ...Object.fromEntries(Object.entries(j).filter(([k, v]) => v !== '' && v != null && !(Array.isArray(v) && !v.length) && !['id', 'createdAt', 'timeline', 'contacts', 'interviews'].includes(k))) };
@@ -270,7 +308,7 @@
     return { added, updated };
   }
   function restoreBackup(data) {
-    const jobs = (data.jobs || []).map((j) => CB.newJob(j));
+    const jobs = (Array.isArray(data.jobs) ? data.jobs : []).map((j) => CB.normalizeJob(j)).filter(Boolean);
     for (const id of [...S.jobs.keys()]) if (!jobs.find((j) => j.id === id)) { S.jobs.delete(id); write('jobs/' + id, null); }
     jobs.forEach((j) => { S.jobs.set(j.id, j); write('jobs/' + j.id, j); });
     if (data.resume) setResume(data.resume);
@@ -287,9 +325,9 @@
   // ─────────── ATS cache ───────────
   let atsCache = new Map(), atsKey = '';
   function profile() {
-    if (!S.resume || !S.resume.text) return null;
-    const p = CB.ATS.parseResume(S.resume.text);
-    return p;
+    if (!S.resume || !S.resume.text || !CB.ATS) return null;
+    try { return CB.ATS.parseResume(S.resume.text); } // memoized inside ats.js
+    catch (e) { CB.reportError(e, { where: 'ats:parseResume', silent: true }); return null; }
   }
   function atsFor(job) {
     const p = profile();
@@ -300,13 +338,169 @@
     let r;
     try {
       r = CB.ATS.score(job, p, { ...S.settings, yearsOverride: S.settings.yearsOverride === '' ? null : S.settings.yearsOverride, resumeWarnings: (S.resume && S.resume.warnings) || [] });
-    } catch (e) { console.error('ATS', e); r = { score: null, verdict: 'ERROR', verdictLabel: 'Could not score', knockouts: [], components: [], skills: { required: [], preferred: [] }, keywords: { matched: [], missing: [] }, fixes: [] }; }
+    } catch (e) { atsFail(e); r = { score: null, verdict: 'ERROR', verdictLabel: 'Could not score', knockouts: [], components: [], skills: { required: [], preferred: [] }, keywords: { matched: [], missing: [] }, fixes: [] }; }
     atsCache.set(jk, r);
     return r;
   }
+  // Log a scoring failure once per distinct message (a missing engine would otherwise log once per job).
+  const atsSeen = new Set();
+  function atsFail(e) {
+    const m = String((e && e.message) || e);
+    if (atsSeen.has(m)) return;
+    atsSeen.add(m);
+    CB.reportError(e, { where: 'ats:score', silent: true, log: !!CB.ATS });
+    if (!CB.ATS) console.warn('[Callback] ATS engine unavailable; scores show as "Could not score".');
+  }
   const atsMap = () => Object.fromEntries(list().map((j) => [j.id, atsFor(j)]));
 
-  CB.Store = Object.assign(S, { init, list, get, add, put, update, remove, removeMany, move, log, undo, setResume, setSettings, loadSamples, clearSamples, importJobs, restoreBackup, clearAll, profile, atsFor, atsMap, DEFAULT_SETTINGS, canUndo: () => undoStack.length > 0 });
+  // ─────────── extension documents: CB.Store.kv(name) ───────────
+  // One JSON value per name for feature modules. Cloud: db doc "ext/<name>" as {value, updatedAt}.
+  // Local: localStorage "callback.kv.<name>" holding the same wrapper. At most 200 KB per value.
+  const KV_MAX = 200 * 1024;
+  const KV_PREFIX = 'callback.kv.';
+  const KV_NAME = /^[A-Za-z0-9][A-Za-z0-9_.~:@+-]{0,99}$/;
+  const kvs = new Map();
+  let initDone = false, resolveInitDone;
+  const initDoneP = new Promise((r) => (resolveInitDone = r));
+  const byteLen = (t) => { try { return new TextEncoder().encode(t).length; } catch (e) { return t.length * 3; } };
+  const kvErr = (code, message) => { const e = new Error(message); e.code = code; return e; };
+  const unwrap = (body) => (body && typeof body === 'object' && Object.prototype.hasOwnProperty.call(body, 'value') ? body.value : body);
+  const toJson = (v) => (v === undefined || v === null ? null : JSON.stringify(v) ?? null);
+  function readLocalKv(name) {
+    try {
+      const raw = localStorage.getItem(KV_PREFIX + name);
+      return raw == null ? null : toJson(unwrap(JSON.parse(raw)));
+    } catch (e) { return null; }
+  }
+  function kvNotify(h, remote) {
+    h.fns.forEach((fn) => {
+      try { fn(h.api.get(), { name: h.name, remote }); } catch (e) { CB.reportError(e, { where: 'kv:' + h.name + ':listener' }); }
+    });
+    CB.emit('kv', { name: h.name, remote });
+  }
+  function kvSetJson(h, json, remote) {
+    if (json === h.json) return;
+    h.json = json;
+    kvNotify(h, remote);
+  }
+  function kvApplySnap(h, snap) {
+    let json = null;
+    try { json = snap && snap.exists ? toJson(unwrap(snap.data())) : null; } catch (e) { json = null; }
+    kvSetJson(h, json, true);
+  }
+  function kvBind(h) {
+    if (h.bound) return;
+    h.bound = true;
+    if (S.mode === 'cloud' && db) {
+      h.backend = 'cloud';
+      const timer = setTimeout(h.resolveReady, 10000);
+      try {
+        h.ref = db.doc('ext/' + h.name);
+        h.unsub = h.ref.onSnapshot((snap) => {
+          clearTimeout(timer);
+          if (!h.writing) kvApplySnap(h, snap); // while our own writes are queued they win; reconciled after they land
+          h.resolveReady();
+        }, (e) => { clearTimeout(timer); h.resolveReady(); CB.reportError(e, { where: 'kv:' + h.name, silent: true }); });
+      } catch (e) { clearTimeout(timer); h.resolveReady(); CB.reportError(e, { where: 'kv:' + h.name, silent: true }); }
+    } else {
+      h.backend = 'local';
+      kvSetJson(h, readLocalKv(h.name), false);
+      h.resolveReady();
+    }
+  }
+  function bindKv() {
+    kvs.forEach(kvBind);
+    if (!initDone) { initDone = true; resolveInitDone(); }
+  }
+  function kvFail(h, e) {
+    try { e.cbReported = true; } catch (x) { /* noop */ }
+    if (h.backend === 'local') storageToast(e); else report(e);
+    CB.reportError(e, { where: 'kv:' + h.name, silent: true, log: false }); // the viewer was told; an environment condition, not a bug
+    console.warn('[Callback] kv "' + h.name + '" not saved:', e.code || e.name, e.message);
+  }
+  async function kvPump(h) {
+    try {
+      while (h.queue) {
+        const { json, waiters } = h.queue;
+        h.queue = null;
+        let err = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            if (json == null) await h.ref.delete();
+            else await h.ref.set({ value: JSON.parse(json), updatedAt: CB.nowISO() });
+            err = null;
+            break;
+          } catch (e) {
+            err = e;
+            if (attempt || !(e && e.code === 'unavailable')) break;
+            await new Promise((r) => setTimeout(r, 400 + Math.random() * 800));
+          }
+        }
+        if (err) { kvFail(h, err); waiters.forEach((w) => w.reject(err)); } else waiters.forEach((w) => w.resolve());
+      }
+    } finally {
+      h.writing = null;
+      // Our burst has landed: take the server's view (a newer edit from another device wins).
+      try { if (h.ref && typeof h.ref.get === 'function') h.ref.get().then((snap) => { if (!h.writing) kvApplySnap(h, snap); }, () => {}); } catch (e) { /* noop */ }
+    }
+  }
+  function kvSet(h, value) {
+    let json;
+    try { json = toJson(value); } catch (e) { return Promise.reject(kvErr('invalid_argument', `Store "${h.name}": this value can't be saved as JSON (${e.message}).`)); }
+    if (json != null) {
+      const n = byteLen(json);
+      if (n > KV_MAX) return Promise.reject(kvErr('too_large', `Store "${h.name}" holds at most 200 KB; this value is ${Math.ceil(n / 1024)} KB. Save less (trim old entries) or split it across several stores.`));
+    }
+    if (!h.bound) return initDoneP.then(() => kvSet(h, value));
+    if (json === h.json && !h.queue) return Promise.resolve();
+    kvSetJson(h, json, false);
+    if (h.backend === 'cloud') {
+      return new Promise((resolve, reject) => {
+        h.queue = { json, waiters: (h.queue ? h.queue.waiters : []).concat([{ resolve, reject }]) };
+        if (!h.writing) h.writing = kvPump(h);
+      });
+    }
+    try {
+      if (json == null) localStorage.removeItem(KV_PREFIX + h.name);
+      else localStorage.setItem(KV_PREFIX + h.name, '{"value":' + json + ',"updatedAt":"' + CB.nowISO() + '"}');
+      return Promise.resolve();
+    } catch (e) {
+      const err = kvErr(isQuota(e) ? 'quota_exceeded' : 'unavailable', isQuota(e) ? `Storage on this device is full; "${h.name}" was not saved. Export a backup and free some space.` : `This browser refused to save "${h.name}".`);
+      kvFail(h, Object.assign(err, { name: e.name }));
+      return Promise.reject(err);
+    }
+  }
+  /**
+   * kv(name) → {name, get(), set(value) → Promise, on(fn(value, {name, remote})) → unsubscribe, ready: Promise}
+   * get() returns a fresh copy (null until loaded). on() fires whenever the value changes — your own set(),
+   * the first cloud snapshot, another device (cloud) or another tab (local). null/undefined deletes.
+   */
+  function kv(name) {
+    name = String(name == null ? '' : name);
+    if (!KV_NAME.test(name)) throw new TypeError(`CB.Store.kv("${name}"): use 1–100 letters, digits and _ . ~ : @ + - (no slashes).`);
+    if (kvs.has(name)) return kvs.get(name).api;
+    const h = { name, json: null, fns: new Set(), bound: false, backend: null, ref: null, unsub: null, writing: null, queue: null };
+    const readyP = new Promise((r) => (h.resolveReady = () => r(h.api)));
+    h.api = Object.freeze({
+      name,
+      get: () => (h.json == null ? null : JSON.parse(h.json)),
+      set: (value) => kvSet(h, value),
+      on: (fn) => { if (typeof fn !== 'function') return () => {}; h.fns.add(fn); return () => h.fns.delete(fn); },
+      ready: readyP,
+    });
+    kvs.set(name, h);
+    if (initDone) kvBind(h);
+    return h.api;
+  }
+  window.addEventListener('storage', (e) => {
+    if (e.key !== null && String(e.key).indexOf(KV_PREFIX) !== 0) return;
+    kvs.forEach((h) => {
+      if (h.backend !== 'local' || (e.key !== null && e.key !== KV_PREFIX + h.name)) return;
+      kvSetJson(h, readLocalKv(h.name), true);
+    });
+  });
+
+  CB.Store = Object.assign(S, { init, list, get, add, put, update, remove, removeMany, move, log, undo, setResume, setSettings, loadSamples, clearSamples, importJobs, restoreBackup, clearAll, profile, atsFor, atsMap, kv, DEFAULT_SETTINGS, canUndo: () => undoStack.length > 0 });
 
   // ═════════════════════════ analytics ═════════════════════════
   function computeStats(jobs, atsById = {}) {
@@ -438,6 +632,41 @@
     return out.sort((x, y) => x.sev - y.sev);
   }
 
+  // Built-in automations + everything registered with CB.registerAction (each one guarded).
+  const ACTION_TYPES = ['open', 'move', 'followup', 'thanks', 'run'];
+  function computeAll(jobs, settings, atsById = {}) {
+    let out;
+    try { out = computeActions(jobs, settings, atsById); }
+    catch (e) { CB.reportError(e, { where: 'auto:built-in' }); out = []; }
+    const reg = (CB._reg && CB._reg.actions) || [];
+    if (!reg.length) return out;
+    const seen = new Set(out.map((a) => a.id));
+    for (const r of reg) {
+      let items;
+      try { items = r.fn(jobs, settings, atsById); }
+      catch (e) {
+        if (r._lastErr !== e.message) { r._lastErr = e.message; CB.reportError(e, { where: 'auto:registered', silent: true }); }
+        continue;
+      }
+      if (!Array.isArray(items)) continue;
+      for (const a of items) {
+        if (!a || typeof a !== 'object' || !a.title || !a.action || typeof a.action !== 'object') continue;
+        const type = typeof a.action.run === 'function' ? 'run' : a.action.type;
+        if (!ACTION_TYPES.includes(type)) continue;
+        if (type !== 'run' && !(a.jobId && S.jobs.has(a.jobId))) continue;
+        if (type === 'move' && !CB.STAGE[a.action.to]) continue;
+        const id = String(a.id || 'x-' + CB.hash(a.title + '|' + (a.jobId || '')));
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(Object.assign({}, a, {
+          id, kind: String(a.kind || 'custom'), sev: [1, 2, 3].includes(+a.sev) ? +a.sev : 3, title: String(a.title), detail: a.detail == null ? '' : String(a.detail),
+          action: Object.assign({ label: 'Open' }, a.action, { type }),
+        }));
+      }
+    }
+    return out.sort((x, y) => x.sev - y.sev);
+  }
+
   CB.Stats = { compute: computeStats };
-  CB.Auto = { compute: computeActions };
+  CB.Auto = { compute: computeAll, builtin: computeActions };
 })();

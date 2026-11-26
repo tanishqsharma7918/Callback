@@ -28,7 +28,7 @@ So the folder needs a web address **once**. After that it lives on your Home Scr
 1. Create a free account at **github.com** (this is only for hosting; the app itself never asks you to sign in).
 2. Click **+** → **New repository**. Name it `callback`, choose **Public**, and click **Create repository**.
 3. On the new page click **uploading an existing file**. Open your unzipped **Callback** folder, press **⌘A** to select
-   **all the files inside it** (about 29, all side by side, with no subfolders) and drag them in. Wait until every file
+   **all the files inside it** (about 38, all side by side, with no subfolders) and drag them in. Wait until every file
    is listed, then click **Commit changes**. On iPhone you can also tap **choose your files**, then select all files in the folder.
 4. Go to **Settings → Pages**. Under **Branch** choose **main** and **/ (root)**, then click **Save**.
 5. Wait 1–2 minutes. Your app is now at **https://YOUR-USERNAME.github.io/callback/**
@@ -86,8 +86,8 @@ Everything except the Claude-powered extras:
 - **Blank page or nothing happens on iPhone:** you're probably viewing a preview in the Files app. Use the web address in Safari (section 2).
 - **Blank page on Mac:** open `index.html` from the *unzipped* folder, not from inside the zip.
 - **Downloads on iPhone:** exports open the Share sheet. Choose **Save to Files**, or open the file in Excel, Word or Numbers.
-- **Updating the app later:** replace the files (re-upload to GitHub). The installed app picks up the new version the next time it opens.
+- **Updating the app later:** upload the new files over the old ones (GitHub: **Add file → Upload files**, drop in every file, **Commit changes**). Your data is not touched. The installed app checks for the new version when it opens; if it is already open you'll see **Callback updated · Reload** at the bottom of the screen. Tap **Reload**. The app never runs a mix of old and new files.
 
 ---
 
-Built with Three.js, ExcelJS, JSZip, PDF.js and Mammoth (see LICENSES.md). Fonts: Bricolage Grotesque, Inter, JetBrains Mono (SIL Open Font License).
+Built with Three.js, ExcelJS, JSZip, PDF.js and Mammoth (see LICENSES.md). Fonts: Bodoni Moda, Geist and Geist Mono (SIL Open Font License).

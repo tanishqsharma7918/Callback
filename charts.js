@@ -1,6 +1,7 @@
-/* Callback — SVG/HTML charts. Colors come from CSS tokens so both themes work.
- * Mark specs: bars ≤ 24px with 4px rounded data-ends, hairline solid grid, 2px surface gaps,
- * text in ink tokens (never series colors), hover tooltip on every mark. */
+/* Callback — SVG/HTML charts. Colors come from CSS tokens so both themes work (index.html, "charts" section).
+ * v3 data-viz spec (luxury-ui.md §8): horizontal hairline gridlines only, Geist Mono 10.5px tabular ticks,
+ * bars ≤ 20px with 2px rounded tops, highlight series (this week / goal / you) in champagne, everything else in
+ * jewel inks or ink-3, direct labels, ▲/▼ glyphs with colour for deltas, glass tooltips, metal score rings. */
 (function () {
   'use strict';
   const CB = (window.CB = window.CB || {});
@@ -50,7 +51,7 @@
     return n;
   }
   /** Bar path with 4px rounded data-end (top), square at baseline. */
-  function colPath(x, y, w, h, r = 4) {
+  function colPath(x, y, w, h, r = 2) {
     if (h <= 0) return '';
     r = Math.min(r, w / 2, h);
     return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
@@ -67,18 +68,18 @@
   function columns(host, data, opts = {}) {
     host.innerHTML = '';
     const W = width(host), H = opts.height || 190;
-    const m = { t: 18, r: 10, b: 26, l: 30 };
+    const m = { t: 20, r: 8, b: 26, l: 28 };
     const iw = W - m.l - m.r, ih = H - m.t - m.b;
     const maxV = niceMax(Math.max(opts.goal || 0, ...data.map((d) => d.value), 1));
     const s = svg(W, H, 'chart');
     const ticks = 4;
     for (let i = 0; i <= ticks; i++) {
       const v = (maxV / ticks) * i, y = m.t + ih - (v / maxV) * ih;
-      el('line', { x1: m.l, x2: W - m.r, y1: y, y2: y, class: i === 0 ? 'c-base' : 'c-grid' }, s);
-      el('text', { x: m.l - 6, y: y + 3.5, class: 'c-tick', 'text-anchor': 'end' }, s).textContent = Math.round(v);
+      el('line', { x1: m.l, x2: W - m.r, y1: Math.round(y) + 0.5, y2: Math.round(y) + 0.5, class: i === 0 ? 'c-base' : 'c-grid' }, s);
+      el('text', { x: m.l - 8, y: y + 3.5, class: 'c-tick', 'text-anchor': 'end' }, s).textContent = Math.round(v);
     }
     const band = iw / data.length;
-    const bw = Math.min(24, band * 0.62);
+    const bw = Math.min(20, band * 0.72);
     data.forEach((d, i) => {
       const x = m.l + i * band + (band - bw) / 2;
       const h = (d.value / maxV) * ih;
@@ -89,12 +90,12 @@
       const html = () => `<b>${esc(d.label)}</b><br>${d.value} ${esc(opts.unit || '')}${opts.goal ? ` · goal ${opts.goal}` : ''}`;
       bindTip(hit, html); bindTip(p, html);
       if (i % Math.ceil(data.length / (W < 420 ? 4 : 6)) === 0 || last) el('text', { x: x + bw / 2, y: H - 8, class: 'c-tick', 'text-anchor': 'middle' }, s).textContent = d.label;
-      if (last && d.value) el('text', { x: x + bw / 2, y: m.t + ih - h - 5, class: 'c-val', 'text-anchor': 'middle' }, s).textContent = d.value;
+      if (last && d.value) el('text', { x: x + bw / 2, y: m.t + ih - h - 6, class: 'c-val', 'text-anchor': 'middle' }, s).textContent = d.value;
     });
     if (opts.goal) {
       const y = m.t + ih - (opts.goal / maxV) * ih;
-      el('line', { x1: m.l, x2: W - m.r, y1: y, y2: y, class: 'c-goal' }, s);
-      el('text', { x: W - m.r, y: y - 5, class: 'c-tick c-goal-t', 'text-anchor': 'end' }, s).textContent = `Goal ${opts.goal}/wk`;
+      el('line', { x1: m.l, x2: W - m.r, y1: Math.round(y) + 0.5, y2: Math.round(y) + 0.5, class: 'c-goal' }, s);
+      el('text', { x: W - m.r, y: y - 6, class: 'c-tick c-goal-t', 'text-anchor': 'end' }, s).textContent = `Goal ${opts.goal} / wk`;
     }
     host.appendChild(s);
   }
@@ -117,8 +118,8 @@
     const weeks = opts.weeks || 26;
     const W = width(host);
     const labelW = 22;
-    const gap = 3;
-    const cell = Math.max(7, Math.min(16, Math.floor((W - labelW - gap * weeks) / weeks)));
+    const gap = 2;
+    const cell = Math.max(7, Math.min(15, Math.floor((W - labelW - gap * weeks) / weeks)));
     const H = 7 * (cell + gap) + 20;
     const realW = labelW + weeks * (cell + gap);
     const s = svg(realW, H, 'chart heat');
@@ -135,7 +136,8 @@
         const iso = CB.toISODate(dt);
         const v = daily[iso] || 0;
         const lvl = v === 0 ? 0 : Math.min(4, Math.ceil((v / max) * 4));
-        const r = el('rect', { x: labelW + w * (cell + gap), y: 16 + d * (cell + gap), width: cell, height: cell, rx: 2.5, class: 'hm hm-' + lvl, tabindex: -1 }, s);
+        const r = el('rect', { x: labelW + w * (cell + gap), y: 16 + d * (cell + gap), width: cell, height: cell, rx: Math.min(3, cell / 4), class: 'hm hm-' + lvl, tabindex: -1 }, s);
+        if (+dt === +end) el('rect', { x: labelW + w * (cell + gap) - 1, y: 16 + d * (cell + gap) - 1, width: cell + 2, height: cell + 2, rx: Math.min(3.5, cell / 4 + 1), class: 'hm-today' }, s);
         bindTip(r, () => `<b>${v} application${v === 1 ? '' : 's'}</b><br>${CB.fmtDate(iso, true)}`);
         if (d === 0 && dt.getMonth() !== lastMonth && dt.getDate() <= 7) {
           lastMonth = dt.getMonth();
@@ -154,17 +156,33 @@
   }
 
   // ───────── ring gauge ─────────
+  let ringSeq = 0;
   function ring(host, value, opts = {}) {
-    const size = opts.size || 120, stroke = opts.stroke || 10;
-    const r = (size - stroke) / 2, c = 2 * Math.PI * r;
+    const size = opts.size || 120, stroke = Math.max(4, Math.round((opts.stroke || 10) * 0.62));
+    const r = (size - stroke) / 2 - 3, c = 2 * Math.PI * r, h = size / 2;
     const v = CB.clamp(value || 0, 0, 1);
+    const gid = 'cb-ring-m' + ++ringSeq;
+    const ticks = Array.from({ length: 60 }, (_, i) => {
+      const a = (i / 60) * Math.PI * 2, major = i % 5 === 0, r1 = h - 0.5, r0 = r1 - (major ? 3.5 : 2);
+      return `<line x1="${(h + Math.sin(a) * r0).toFixed(2)}" y1="${(h - Math.cos(a) * r0).toFixed(2)}" x2="${(h + Math.sin(a) * r1).toFixed(2)}" y2="${(h - Math.cos(a) * r1).toFixed(2)}" class="ring-tick" stroke-width="${major ? 1 : 0.6}"${major ? '' : ' opacity=".55"'}/>`;
+    }).join('');
     host.innerHTML = `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" class="ring" role="img" aria-label="${esc(opts.aria || '')}">
-      <circle cx="${size / 2}" cy="${size / 2}" r="${r}" class="ring-track" stroke-width="${stroke}" fill="none"></circle>
-      <circle cx="${size / 2}" cy="${size / 2}" r="${r}" class="ring-fill" stroke-width="${stroke}" fill="none" stroke-linecap="round"
-        style="stroke:${opts.color || 'var(--accent-strong)'};stroke-dasharray:${c};stroke-dashoffset:${c}" transform="rotate(-90 ${size / 2} ${size / 2})"></circle>
+      <defs><linearGradient id="${gid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" style="stop-color:var(--gold-100)"/><stop offset=".3" style="stop-color:var(--gold-300)"/><stop offset=".52" style="stop-color:var(--gold-500)"/><stop offset=".72" style="stop-color:var(--gold-200)"/><stop offset="1" style="stop-color:var(--gold-400)"/></linearGradient></defs>
+      ${ticks}
+      <circle cx="${h}" cy="${h}" r="${r}" class="ring-track" stroke-width="${stroke}" fill="none"></circle>
+      <circle cx="${h}" cy="${h}" r="${r}" class="ring-fill" stroke-width="${stroke}" fill="none" stroke-linecap="round"
+        style="stroke:url(#${gid});stroke-dasharray:${c};stroke-dashoffset:${c}" transform="rotate(-90 ${h} ${h})"></circle>
+      ${opts.color && v > 0 ? `<g class="ring-end" style="transform-origin:${h}px ${h}px;transform:rotate(0deg)"><circle cx="${h}" cy="${h - r}" r="${Math.max(2.5, stroke / 2 - 0.5)}" style="fill:${opts.color}" stroke="var(--surface-1)" stroke-width="1.5"></circle></g>` : ''}
     </svg><div class="ring-center"><div class="ring-v">${esc(opts.label != null ? opts.label : Math.round(v * 100) + '%')}</div><div class="ring-s">${esc(opts.sub || '')}</div></div>`;
     const f = host.querySelector('.ring-fill');
-    requestAnimationFrame(() => requestAnimationFrame(() => { f.style.transition = 'stroke-dashoffset 900ms cubic-bezier(.2,.8,.2,1)'; f.style.strokeDashoffset = c * (1 - v); }));
+    const endDot = host.querySelector('.ring-end');
+    const reduce = CB.FX && CB.FX.reduced && CB.FX.reduced();
+    const go = () => {
+      f.style.transition = reduce ? 'none' : 'stroke-dashoffset 1100ms cubic-bezier(.22,1,.36,1)';
+      f.style.strokeDashoffset = c * (1 - v);
+      if (endDot) { endDot.style.transition = reduce ? 'none' : 'transform 1100ms cubic-bezier(.22,1,.36,1)'; endDot.style.transform = `rotate(${(v * 360).toFixed(1)}deg)`; }
+    };
+    if (reduce) go(); else requestAnimationFrame(() => requestAnimationFrame(go));
   }
 
   // ───────── ATS histogram with response calibration ─────────
@@ -180,14 +198,14 @@
       el('line', { x1: m.l, x2: W - m.r, y1: y, y2: y, class: i === 0 ? 'c-base' : 'c-grid' }, s);
       el('text', { x: m.l - 6, y: y + 3.5, class: 'c-tick', 'text-anchor': 'end' }, s).textContent = Math.round(v);
     }
-    const band = iw / buckets.length, bw = Math.min(24, band * 0.7);
+    const band = iw / buckets.length, bw = Math.min(20, band * 0.7);
     const zone = (b) => (b.from + 5 < (opts.floor || 60) ? 'bad' : b.from + 5 < (opts.competitive || 75) ? 'warn' : 'good');
     buckets.forEach((b, i) => {
       const x = m.l + i * band + (band - bw) / 2;
       const h = (b.count / maxV) * ih;
       const hr = (b.interviewed / maxV) * ih;
       el('path', { d: colPath(x, m.t + ih - h, bw, h), class: 'c-hist c-hist-' + zone(b) }, s);
-      if (hr > 0) el('path', { d: colPath(x, m.t + ih - hr, bw, hr, hr >= h - 1 ? 4 : 0), class: 'c-hist-in' }, s);
+      if (hr > 0) el('path', { d: colPath(x, m.t + ih - hr, bw, hr, hr >= h - 1 ? 2 : 0), class: 'c-hist-in' }, s);
       const hit = el('rect', { x: m.l + i * band, y: m.t, width: band, height: ih, class: 'c-hit', tabindex: 0 }, s);
       bindTip(hit, () => `<b>ATS ${b.from}–${b.to - 1}</b><br>${b.count} applied · ${b.interviewed} got a screen${b.count ? ` (${Math.round((b.interviewed / b.count) * 100)}%)` : ''}`);
       if (i % 2 === 0) el('text', { x: m.l + i * band, y: H - 12, class: 'c-tick', 'text-anchor': 'middle' }, s).textContent = b.from;
@@ -227,7 +245,7 @@
     const narrow = W < 520;
     const H = narrow ? 228 : 246;
     const m = { t: 26, l: 8, r: narrow ? 8 : 16 };
-    const nodeW = 12;
+    const nodeW = 8;
     const colGap = (W - m.l - m.r - nodeW) / (cols.length - 1);
     const mainH = H * 0.46;
     const k = mainH / Math.max(1, reached[0]);
@@ -275,7 +293,7 @@
     // nodes + labels
     cols.forEach((c, i) => {
       const h = Math.max(2, reached[i] * k);
-      el('rect', { x: xs[i], y: m.t, width: nodeW, height: h, rx: 3, class: 'flow-node', style: `fill:var(--st-${c.key})` }, s);
+      el('rect', { x: xs[i], y: m.t, width: nodeW, height: h, rx: 2, class: 'flow-node', style: `fill:var(--st-${c.key})` }, s);
       const anchor = i === cols.length - 1 ? 'end' : i === 0 ? 'start' : 'middle';
       const lx = i === cols.length - 1 ? xs[i] + nodeW : i === 0 ? xs[i] : xs[i] + nodeW / 2;
       el('text', { x: lx, y: m.t - 10, class: 'flow-label', 'text-anchor': anchor }, s).textContent = c.label;
@@ -296,8 +314,8 @@
     const total = parts.reduce((a, p) => a + p.value, 0) || 1;
     host.innerHTML = `<div class="seg" role="img" aria-label="${esc(parts.map((p) => `${p.label} ${p.value}`).join(', '))}">${parts.filter((p) => p.value).map((p, i) => {
       const pct = (p.value / total) * 100;
-      return `<div class="seg-part" tabindex="0" data-i="${i}" style="flex:${p.value} 1 0;background:${p.color};color:${p.ink || '#fff'}">${pct >= 9 ? `<span>${p.value}</span>` : ''}</div>`;
-    }).join('')}</div><div class="seg-legend">${parts.filter((p) => p.value).map((p) => `<span><i style="background:${p.color}"></i>${esc(p.label)}</span>`).join('')}</div>`;
+      return `<div class="seg-part" tabindex="0" data-i="${i}" style="flex:${p.value} 1 0;background:${p.color}">${pct >= 9 ? `<span>${p.value}</span>` : ''}</div>`;
+    }).join('')}</div><div class="seg-legend">${parts.filter((p) => p.value).map((p) => `<span><i style="background:${p.color}"></i>${esc(p.label)}<b>${p.value}</b></span>`).join('')}</div>`;
     const live = parts.filter((p) => p.value);
     host.querySelectorAll('.seg-part').forEach((n, i) => bindTip(n, () => `<b>${esc(live[i].label)}</b><br>${live[i].value} · ${Math.round((live[i].value / total) * 100)}%`));
   }
@@ -306,10 +324,10 @@
   function spark(host, values, opts = {}) {
     const W = opts.width || 96, H = opts.height || 28;
     const max = Math.max(...values, 1), min = 0;
-    const pts = values.map((v, i) => [(i / Math.max(1, values.length - 1)) * (W - 6) + 3, H - 4 - ((v - min) / (max - min || 1)) * (H - 8)]);
+    const pts = values.map((v, i) => [(i / Math.max(1, values.length - 1)) * (W - 8) + 4, H - 4 - ((v - min) / (max - min || 1)) * (H - 8)]);
     const d = pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join('');
     const last = pts[pts.length - 1];
-    host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" class="spark" aria-hidden="true"><path d="${d}V${H}H3Z" class="spark-area"/><path d="${d}" class="spark-line"/><circle cx="${last[0]}" cy="${last[1]}" r="3" class="spark-dot"/></svg>`;
+    host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" class="spark" aria-hidden="true"><path d="${d}V${H}H3Z" class="spark-area"/><path d="${d}" class="spark-line"/><circle cx="${last[0]}" cy="${last[1]}" r="2.75" class="spark-dot"/></svg>`;
   }
 
   // ───────── 2D fallback for the 3D tower ─────────

@@ -4,15 +4,42 @@
  * Optional voice: `tts` speaks replies, `dictation` takes voice input (where the viewer supports them). */
 (function () {
   'use strict';
-  const CB = window.CB;
+  const CB = (window.CB = window.CB || {});
   const $ = (s, r = document) => r.querySelector(s);
   const E = CB.esc;
   const S = () => CB.Store;
   const UI = () => CB.UI;
   const A = { open: false, turns: [], log: [], mascot: null, busy: false, ctl: null, voice: false, tts: null, dict: null, toolsOk: null, maxTools: 16, cur: null, nudged: '' };
   const LS = 'callback.cal';
-  const VIEWS = ['dashboard', 'board', 'sheet', 'calendar', 'ats', 'inbox', 'reports', 'settings'];
+  const BUILTIN_VIEWS = ['dashboard', 'board', 'sheet', 'calendar', 'ats', 'inbox', 'reports', 'settings'];
   const VIEW_NAMES = { dashboard: 'Dashboard', board: 'Pipeline board', sheet: 'Spreadsheet', calendar: 'Calendar', ats: 'ATS Lab', inbox: 'Inbox Parser', reports: 'Reports & Export', settings: 'Settings' };
+  // Views registered by feature modules (CB.registerView) are reachable by Cal too.
+  const allViews = () => { try { return CB.App && CB.App.views ? CB.App.views() : []; } catch (e) { return []; } };
+  const viewKeys = () => { const k = allViews().map((v) => v.key); return k.length ? k : BUILTIN_VIEWS; };
+  const viewName = (k) => VIEW_NAMES[k] || (allViews().find((v) => v.key === k) || {}).label || k;
+  const extViews = () => allViews().filter((v) => v.reg);
+  const reEsc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // ───────────────────────── extension points ─────────────────────────
+  const INTENTS = []; // {re, handler}
+  const EXT_TOOLS = []; // {name, description, inputSchema, execute}
+  /** registerIntent(regex, handler(text, say, act) → true if handled). Checked before the built-in local commands. */
+  function registerIntent(re, handler) {
+    if (typeof re === 'string') { try { re = new RegExp(re, 'i'); } catch (e) { re = null; } }
+    if (!(re instanceof RegExp) || typeof handler !== 'function') { console.warn('[Callback] Cal.registerIntent ignored: needs (RegExp, function)'); return () => {}; }
+    const it = { re, handler };
+    INTENTS.push(it);
+    return () => { const i = INTENTS.indexOf(it); if (i >= 0) INTENTS.splice(i, 1); };
+  }
+  /** registerTool({name, description, inputSchema, execute(input, ctx)}) — appended to Claude's tools (within maxTools). */
+  function registerTool(def) {
+    if (!def || !/^[A-Za-z0-9_-]{1,64}$/.test(String(def.name || '')) || typeof def.execute !== 'function') { console.warn('[Callback] Cal.registerTool ignored: needs {name (A-Z a-z 0-9 _ -), description, execute}', def); return () => {}; }
+    const schema = def.inputSchema && typeof def.inputSchema === 'object' && !Array.isArray(def.inputSchema) ? Object.assign({ type: 'object' }, def.inputSchema) : { type: 'object', properties: {} };
+    const t = { name: def.name, description: String(def.description || def.name).slice(0, 1000), inputSchema: schema, execute: def.execute };
+    const i = EXT_TOOLS.findIndex((x) => x.name === t.name);
+    if (i >= 0) EXT_TOOLS.splice(i, 1, t); else EXT_TOOLS.push(t);
+    return () => { const k = EXT_TOOLS.indexOf(t); if (k >= 0) EXT_TOOLS.splice(k, 1); };
+  }
   const TABS = ['overview', 'ats', 'interviews', 'contacts', 'docs', 'timeline'];
   const STAGE_KEYS = CB.STAGES.map((s) => s.key);
 
@@ -112,9 +139,9 @@ Keyboard (Mac): ⌘K command palette, N add job, 1–8 switch views, ⌘Z undo. 
         hasJobDescription: !!String(j.jd || '').trim(),
       };
     });
-    add('open_in_app', 'Show something on screen: switch to a view, or open one application on a drawer tab.', { view: { type: 'string', enum: VIEWS }, id: { type: 'string' }, tab: { type: 'string', enum: TABS } }, [], (i) => {
+    add('open_in_app', 'Show something on screen: switch to a view, or open one application on a drawer tab.', { view: { type: 'string', enum: viewKeys() }, id: { type: 'string' }, tab: { type: 'string', enum: TABS } }, [], (i) => {
       if (i.id) { const j = job(i.id); setTimeout(() => { minimizeOnSmall(true); UI().openJob(j.id, i.tab || 'overview'); }, 250); act(`Opened ${name(j)}${i.tab ? ' · ' + i.tab : ''}`); return 'opened'; }
-      if (i.view && VIEWS.includes(i.view)) { location.hash = i.view; minimizeOnSmall(); act(`Went to ${VIEW_NAMES[i.view]}`); return 'switched to ' + i.view; }
+      if (i.view && viewKeys().includes(i.view)) { location.hash = i.view; minimizeOnSmall(); act(`Went to ${viewName(i.view)}`); return 'switched to ' + i.view; }
       throw new Error('Give a view or an id.');
     });
     add('create_application', 'Track a new job. Include the posting text when the user pasted it (it powers the ATS score). Status defaults to saved; use applied if they already applied (appliedDate defaults to today).', {
@@ -222,6 +249,19 @@ Keyboard (Mac): ⌘K command palette, N add job, 1–8 switch views, ⌘Z undo. 
       act(`Deleted ${name(j)}`, { undo: true });
       return 'deleted';
     });
+    // Registered tools come after the built-ins; the viewer's tool limit applies to the whole list.
+    const names = new Set(T.map((t) => t.name));
+    EXT_TOOLS.forEach((t) => {
+      if (names.has(t.name)) return;
+      names.add(t.name);
+      T.push({
+        name: t.name, description: t.description, inputSchema: t.inputSchema,
+        execute: async (inp, ctx) => {
+          try { return await t.execute(inp || {}, ctx); }
+          catch (e) { CB.reportError(e, { where: 'cal:tool:' + t.name, silent: true }); throw e instanceof Error ? e : new Error(String((e && e.message) || e)); }
+        },
+      });
+    });
     return T.slice(0, A.maxTools);
   }
 
@@ -281,7 +321,7 @@ Rules:
 - Items marked example are fictional sample data the user can clear on the Dashboard.
 
 How the app works:
-${GUIDE}
+${GUIDE}${extViews().length ? '\nMore views: ' + extViews().map((v) => `${v.label} (open_in_app view "${v.key}")${v.crumb ? ' — ' + v.crumb : ''}`).join(' · ') : ''}
 
 Current snapshot (JSON):
 ${JSON.stringify(overview())}`;
@@ -383,7 +423,34 @@ ${JSON.stringify(overview())}`;
     return 'Technical screen';
   }
 
+  /** Registered intents first; an async handler may resolve false to fall through. */
+  function runIntents(text, from = 0) {
+    const m = A.cur;
+    for (let i = from; i < INTENTS.length; i++) {
+      const it = INTENTS[i];
+      let hit = false;
+      try { it.re.lastIndex = 0; hit = it.re.test(text); } catch (e) { hit = false; }
+      if (!hit) continue;
+      let said = false;
+      const say = (x) => { said = true; if (m) { m.text = String(x == null ? '' : x); m.thinking = false; renderLog(); } };
+      const actFn = (x, opts = {}) => { if (!m) return; m.acts.push({ text: String(x), jobId: opts.jobId || null, undo: !!opts.undo, tab: opts.tab || null }); renderLog(); };
+      try {
+        const r = it.handler(text, say, actFn);
+        if (r && typeof r.then === 'function') {
+          return r.then((ok) => (ok === true || (ok !== false && said) ? true : runIntents(text, i + 1)), (e) => { CB.reportError(e, { where: 'cal:intent', silent: true }); return runIntents(text, i + 1); });
+        }
+        if (r === true || (r !== false && said)) return true;
+      } catch (e) { CB.reportError(e, { where: 'cal:intent', silent: true }); }
+    }
+    return false;
+  }
   function localBrain(text) {
+    const r = runIntents(text);
+    if (r === true) return undefined;
+    if (r && typeof r.then === 'function') return r.then((ok) => { if (!ok) builtinBrain(text); });
+    return builtinBrain(text);
+  }
+  function builtinBrain(text) {
     const t = text.toLowerCase().trim();
     const say = (s) => { A.cur.text = s; };
     const j = jobFromText(text);
@@ -484,11 +551,11 @@ ${JSON.stringify(overview())}`;
     }
     if ((m = /\b(dark|light)\s*(mode|theme)\b/.exec(t))) { UI().setTheme(m[1]); return say(`Switched to ${m[1]} mode.`); }
     if ((m = /\b(brutal|harsh|standard)\b/.exec(t)) && /\b(mode|strict|ats)\b/.test(t)) { S().setSettings({ strictness: m[1] }); return say(`ATS strictness is now **${m[1]}**; everything was re-scored.`); }
-    const views = [['dashboard', /dashboard|home/], ['board', /board|pipeline|kanban/], ['sheet', /sheet|spreadsheet|grid|excel view|table/], ['calendar', /calendar|schedule view/], ['ats', /\bats\b|resume|scoreboard|ats lab/], ['inbox', /inbox|email parser|emails?/], ['reports', /reports?|analytics|export page/], ['settings', /settings|preferences/]];
+    const views = [...extViews().map((v) => [v.key, new RegExp('\\b' + reEsc(String(v.label).toLowerCase()) + '\\b')]), ['dashboard', /dashboard|home/], ['board', /board|pipeline|kanban/], ['sheet', /sheet|spreadsheet|grid|excel view|table/], ['calendar', /calendar|schedule view/], ['ats', /\bats\b|resume|scoreboard|ats lab/], ['inbox', /inbox|email parser|emails?/], ['reports', /reports?|analytics|export page/], ['settings', /settings|preferences/]];
     if (/\b(go to|open|show|take me|switch to|view)\b/.test(t)) {
       if (j && !/\b(dashboard|board|sheet|calendar|ats lab|inbox|reports|settings)\b/.test(t)) { setTimeout(() => { minimizeOnSmall(true); UI().openJob(j.id); }, 200); act(`Opened ${name(j)}`, { jobId: j.id }); return say(`Opening **${name(j)}**.`); }
       const v = views.find(([, re]) => re.test(t));
-      if (v) { location.hash = v[0]; minimizeOnSmall(); act(`Went to ${VIEW_NAMES[v[0]]}`); return say(`Here's **${VIEW_NAMES[v[0]]}**.`); }
+      if (v) { location.hash = v[0]; minimizeOnSmall(); act(`Went to ${viewName(v[0])}`); return say(`Here's **${viewName(v[0])}**.`); }
     }
     if ((m = /\b(find|search|look up|show|list)\b\s+(.+)/.exec(t))) {
       const st = STAGE_WORDS.find(([w]) => m[2].includes(w));
@@ -542,7 +609,7 @@ ${JSON.stringify(overview())}`;
     A.host = document.createElement('div');
     A.host.className = 'cal-host';
     $('#cal-dock-stage').appendChild(A.host);
-    try { A.mascot = CB.Mascot.create(A.host, { onClick: () => { if (A.open) setMascot('happy', 1400); } }); } catch (e) { console.error(e); }
+    try { A.mascot = CB.Mascot.create(A.host, { onClick: () => { if (A.open) setMascot('happy', 1400); } }); } catch (e) { CB.reportError(e, { where: 'cal:mascot', silent: true, log: !!CB.Mascot }); }
     $('#cal-dock').onclick = () => (A.open ? close() : openPanel());
     $('#cal-close').onclick = close;
     $('#cal-clear').onclick = () => { if (A.ctl) A.ctl.abort(); A.turns = []; A.log = []; saveLog(); greet(); };
@@ -665,7 +732,8 @@ ${JSON.stringify(overview())}`;
     A.busy = true;
     setMascot('thinking');
     setStatus('Thinking…');
-    const sample = CB.App.ai ? await CB.AI.get() : null;
+    let sample = null;
+    try { sample = CB.App && CB.App.ai && CB.AI ? await CB.AI.get() : null; } catch (e) { sample = null; }
     try {
       if (sample) {
         try { await claudeBrain(text, sample); }
@@ -673,14 +741,14 @@ ${JSON.stringify(overview())}`;
           if (e && e.code === 'cancelled') { A.cur.text = A.cur.text || '_Stopped._'; }
           else {
             const msg = CB.AI.errText(e);
-            localBrain(text);
+            await localBrain(text);
             A.cur.local = true;
             if (msg) A.cur.text += `\n\n_(${msg} I handled this with my built-in commands.)_`;
           }
         }
-      } else { localBrain(text); A.cur.local = true; }
+      } else { await localBrain(text); A.cur.local = true; }
     } catch (e) {
-      console.error(e);
+      CB.reportError(e, { where: 'cal', silent: true });
       A.cur.text = 'Something went wrong on my side: ' + (e.message || 'unknown error') + '.';
       setMascot('concerned', 2000);
     }
@@ -707,6 +775,12 @@ ${JSON.stringify(overview())}`;
     b.onclick = () => openPanel();
     clearTimeout(A.bt);
     A.bt = setTimeout(() => (b.hidden = true), ms);
+    if (!A.bubbleWired) {
+      A.bubbleWired = true;
+      const hide = (e) => { const bb = $('#cal-bubble'); if (!bb || bb.hidden) return; if (e && e.target && e.target.closest && e.target.closest('.calbot')) return; bb.hidden = true; clearTimeout(A.bt); };
+      document.addEventListener('pointerdown', hide, true);
+      window.addEventListener('hashchange', () => hide(null));
+    }
   }
   function react(d) {
     const j = S().get(d.id);
@@ -730,5 +804,5 @@ ${JSON.stringify(overview())}`;
     void o;
   }
 
-  CB.Cal = { mount, open: openPanel, close, send, parseWhen, localBrain, show: (on) => { const r = $('#cal'); if (r) r.hidden = !on; try { localStorage.setItem(LS + '.hidden', on ? '0' : '1'); } catch (e) { /* noop */ } } };
+  CB.Cal = { mount, open: openPanel, close, send, parseWhen, localBrain, registerIntent, registerTool, act, show: (on) => { const r = $('#cal'); if (r) r.hidden = !on; try { localStorage.setItem(LS + '.hidden', on ? '0' : '1'); } catch (e) { /* noop */ } } };
 })();

@@ -201,6 +201,7 @@
         const s = document.createElement('script');
         s.src = src;
         s.async = true;
+        s.setAttribute('data-lazy', '1'); // load failures are handled by the caller, not the global boundary
         s.onload = () => res();
         s.onerror = () => { delete scriptCache[src]; rej(new Error('Could not load ' + src.split('/').slice(-2).join('/'))); };
         document.head.appendChild(s);
@@ -214,11 +215,11 @@
   CB.LIBS = LB ? {
     exceljs: LB + 'exceljs.min.js', jszip: LB + 'jszip.min.js', pdfjs: LB + 'pdf.min.js', pdfworker: LB + 'pdf.worker.min.js', mammoth: LB + 'mammoth.browser.min.js',
   } : {
-    exceljs: 'https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js',
-    jszip: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
-    pdfjs: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-    pdfworker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
-    mammoth: 'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js',
+    exceljs: 'exceljs.min.js?v=4c982e77f1',
+    jszip: 'jszip.min.js?v=4c982e77f1',
+    pdfjs: 'pdf.min.js?v=4c982e77f1',
+    pdfworker: 'pdf.worker.min.js?v=4c982e77f1',
+    mammoth: 'mammoth.browser.min.js?v=4c982e77f1',
   };
 
   // ───────── platform capabilities (claude.ai viewer) ─────────
@@ -278,8 +279,193 @@
     }
   };
 
-  // Tiny event bus
+  /**
+   * Repair a stored job so every field the views read exists with the right type.
+   * Never mutates `raw` (cloud snapshots are frozen); unknown extension fields are kept.
+   * Returns null for anything that is not an object.
+   */
+  const JOB_STR = ['company', 'title', 'location', 'workMode', 'employmentType', 'seniority', 'source', 'url', 'linkedinJobId', 'salaryCurrency', 'salaryPeriod', 'priority', 'appliedDate', 'followUpDate', 'deadline', 'postedDate', 'responseDate', 'referrerName', 'jd', 'notes', 'coverLetter', 'rejectionReason', 'rejectionStage'];
+  const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  const str = (v, d = '') => (v == null ? d : typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : d);
+  const numOrNull = (v) => (v === '' || v == null || typeof v === 'boolean' ? null : Number.isFinite(+v) ? +v : null);
+  const objList = (v) => (Array.isArray(v) ? v.filter(isObj) : []);
+  CB.normalizeJob = (raw) => {
+    if (!isObj(raw)) return null;
+    const base = CB.newJob();
+    const j = Object.assign({}, raw);
+    j.id = str(raw.id) || base.id;
+    for (const k of JOB_STR) j[k] = raw[k] == null ? base[k] : str(raw[k], base[k]);
+    j.createdAt = str(raw.createdAt) || str(raw.updatedAt) || base.createdAt;
+    j.updatedAt = str(raw.updatedAt) || j.createdAt;
+    j.sample = !!raw.sample;
+    j.referral = !!raw.referral;
+    j.status = CB.STAGE[raw.status] ? raw.status : 'saved';
+    j.maxStage = Math.max(Number.isFinite(+raw.maxStage) ? +raw.maxStage : 0, CB.STAGE[j.status].order, 0);
+    j.excitement = raw.excitement == null || !Number.isFinite(+raw.excitement) ? base.excitement : CB.clamp(Math.round(+raw.excitement), 0, 5);
+    j.salaryMin = numOrNull(raw.salaryMin);
+    j.salaryMax = numOrNull(raw.salaryMax);
+    j.applicants = numOrNull(raw.applicants);
+    j.jdAI = isObj(raw.jdAI) ? raw.jdAI : null;
+    j.offer = isObj(raw.offer) ? raw.offer : null;
+    j.tags = Array.isArray(raw.tags) ? raw.tags.filter((t) => t != null && t !== '').map((t) => str(t)).filter(Boolean) : [];
+    j.contacts = objList(raw.contacts).map((c) => Object.assign({}, c, {
+      id: str(c.id) || CB.uid('c_'), name: str(c.name), role: str(c.role, 'Other'), email: str(c.email), phone: str(c.phone), linkedin: str(c.linkedin), notes: str(c.notes),
+    }));
+    j.interviews = objList(raw.interviews).map((iv, i) => Object.assign({}, iv, {
+      id: str(iv.id) || CB.uid('i_'), round: Number.isFinite(+iv.round) && +iv.round > 0 ? +iv.round : i + 1, type: str(iv.type) || 'Interview',
+      datetime: str(iv.datetime), durationMin: Number.isFinite(+iv.durationMin) && +iv.durationMin > 0 ? +iv.durationMin : 45,
+      interviewer: str(iv.interviewer), link: str(iv.link), outcome: CB.INTERVIEW_OUTCOMES.includes(iv.outcome) ? iv.outcome : 'Scheduled',
+      notes: str(iv.notes), thankYouSent: !!iv.thankYouSent,
+    }));
+    j.timeline = objList(raw.timeline).map((t) => Object.assign({}, t, {
+      id: str(t.id) || CB.uid('t_'), ts: str(t.ts) || j.createdAt, kind: str(t.kind) || 'note', text: str(t.text),
+    }));
+    return j;
+  };
+
+  // ───────── tiny event bus ─────────
   const handlers = {};
   CB.on = (ev, fn) => ((handlers[ev] = handlers[ev] || []).push(fn), () => (handlers[ev] = handlers[ev].filter((f) => f !== fn)));
-  CB.emit = (ev, data) => (handlers[ev] || []).slice().forEach((f) => { try { f(data); } catch (e) { console.error(e); } });
+  CB.emit = (ev, data) => (handlers[ev] || []).slice().forEach((f) => {
+    try { f(data); } catch (e) {
+      if (ev === 'error') console.error(e);
+      else CB.reportError(e, { where: 'event:' + ev });
+    }
+  });
+
+  // ───────── CSS injection for feature modules ─────────
+  /** Inject or replace `<style data-cb="id">`. Placed after the base stylesheet so module rules win ties. */
+  const cssEls = {};
+  CB.css = (id, cssText) => {
+    const key = String(id == null ? 'anon' : id);
+    const txt = String(cssText == null ? '' : cssText);
+    let el = cssEls[key];
+    if (!el || !el.isConnected) {
+      el = null;
+      const all = document.getElementsByTagName('style');
+      for (let i = 0; i < all.length; i++) if (all[i].getAttribute('data-cb') === key) { el = all[i]; break; }
+      if (!el) {
+        el = document.createElement('style');
+        el.setAttribute('data-cb', key);
+        (document.body || document.head || document.documentElement).appendChild(el);
+      }
+      cssEls[key] = el;
+    }
+    if (el.textContent !== txt) el.textContent = txt;
+    return el;
+  };
+
+  // ───────── error log + global error capture ─────────
+  // Everything is recorded here; js/app.js turns non-silent records into a toast with "Details".
+  CB.errors = [];
+  CB._loadFailures = []; // scripts of ours that failed to load this session
+  const shortSrc = (u) => String(u || '').split('?')[0].split('/').slice(-2).join('/');
+  /**
+   * Record a problem. info: {where, silent (no toast — e.g. a recovery card is already showing), log (console, default true)}.
+   * Never throws. Returns the record.
+   */
+  CB.reportError = (err, info = {}) => {
+    try {
+      const e = err instanceof Error ? err : new Error(typeof err === 'string' ? err : (err && (err.message || err.code)) || 'Unknown error');
+      try { e.cbReported = true; } catch (x) { /* frozen */ }
+      const rec = {
+        id: CB.uid('err_'), at: CB.nowISO(), where: String(info.where || ''), kind: info.kind || 'error', silent: !!info.silent,
+        message: String(e.message || e.name || 'Error').slice(0, 500), stack: String(e.stack || '').slice(0, 4000),
+      };
+      CB.errors.push(rec);
+      if (CB.errors.length > 30) CB.errors.shift();
+      if (info.log !== false) console.error('[Callback]' + (rec.where ? ' ' + rec.where + ':' : ''), err);
+      CB.emit('error', rec);
+      return rec;
+    } catch (x) { return null; }
+  };
+  window.addEventListener('error', (ev) => {
+    const t = ev.target;
+    if (t && t !== window && t.nodeType === 1) {
+      // Resource load failure (capture phase). Only our scripts matter; lazy libs report to their caller.
+      if (t.tagName === 'SCRIPT' && !t.hasAttribute('data-lazy')) CB._loadFailures.push(shortSrc(t.src)), CB.reportError(new Error('A part of Callback did not load (' + shortSrc(t.src) + '). Everything else keeps working.'), { where: 'load', kind: 'load', log: false });
+      return;
+    }
+    const msg = String(ev.message || '');
+    if (/ResizeObserver loop/i.test(msg)) return;
+    if (ev.error && ev.error.cbReported) return;
+    if (!ev.filename && /^Script error\.?$/.test(msg)) { CB.reportError(new Error(msg), { where: 'cross-origin', silent: true, log: false }); return; }
+    CB.reportError(ev.error || new Error(msg || 'Unknown error'), { where: ev.filename ? shortSrc(ev.filename) + ':' + (ev.lineno || 0) : '', log: false });
+  }, true);
+  window.addEventListener('unhandledrejection', (ev) => {
+    const r = ev.reason;
+    if (r && (r.name === 'AbortError' || r.code === 'cancelled' || r.code === 'declined' || r.cbReported)) return;
+    CB.reportError(r instanceof Error ? r : new Error(r && (r.message || r.code) ? String(r.message || r.code) : String(r)), { where: 'async', log: false });
+  });
+
+  // ───────── extension registries (see docs/BUILD.md §3) ─────────
+  // Callable at any time, before or after boot. Each register* returns an unregister function.
+  // Changes emit 'registry' {kind, key, removed} so mounted UI refreshes.
+  const REG = (CB._reg = { views: [], drawerTabs: [], drawerActions: [], dashCards: [], commands: [], actions: [], settings: [] });
+  let regSeq = 0;
+  const noop = () => {};
+  const bad = (what, msg, def) => { console.warn('[Callback] ' + what + ' ignored: ' + msg, def); return noop; };
+  const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+  const num = (v, d) => (Number.isFinite(+v) && v !== '' && v !== null ? +v : d);
+  function addReg(list, kind, item, id) {
+    item._seq = ++regSeq;
+    item._id = id;
+    const arr = REG[list];
+    const i = arr.findIndex((x) => x._id === id);
+    if (i >= 0) arr.splice(i, 1, item); else arr.push(item);
+    arr.sort((a, b) => (a.order - b.order) || (a._seq - b._seq));
+    CB.emit('registry', { kind, key: id });
+    return () => {
+      const k = REG[list].indexOf(item);
+      if (k < 0) return;
+      REG[list].splice(k, 1);
+      CB.emit('registry', { kind, key: id, removed: true });
+    };
+  }
+  /** {key, label, icon, sec:'Track'|'Analyze'|'You', crumb, render(root, opts), order} — opts: {refresh, cleanup(fn), onLeave(fn)} */
+  CB.registerView = (d) => {
+    if (!d || !KEY_RE.test(String(d.key || ''))) return bad('registerView', 'key must be letters, digits, - or _', d);
+    if (typeof d.render !== 'function') return bad('registerView', 'render(root, opts) is required', d);
+    const sec = ['Track', 'Analyze', 'You'].includes(d.sec) ? d.sec : 'Analyze';
+    return addReg('views', 'view', { key: d.key, label: str(d.label) || d.key, icon: d.icon || 'spark', sec, crumb: str(d.crumb), order: num(d.order, 50), render: d.render }, d.key);
+  };
+  /** {key, label (string or fn(job)), order, render(body, job, ctx)} — ctx: {cleanup(fn), refresh()} */
+  CB.registerDrawerTab = (d) => {
+    if (!d || !KEY_RE.test(String(d.key || ''))) return bad('registerDrawerTab', 'key must be letters, digits, - or _', d);
+    if (typeof d.render !== 'function') return bad('registerDrawerTab', 'render(body, job) is required', d);
+    return addReg('drawerTabs', 'drawerTab', { key: d.key, label: d.label || d.key, order: num(d.order, 50), render: d.render }, d.key);
+  };
+  /** {key, icon, title, run(job), order?} — icon button in the job drawer header */
+  CB.registerDrawerAction = (d) => {
+    if (!d || !KEY_RE.test(String(d.key || ''))) return bad('registerDrawerAction', 'key must be letters, digits, - or _', d);
+    if (typeof d.run !== 'function') return bad('registerDrawerAction', 'run(job) is required', d);
+    return addReg('drawerActions', 'drawerAction', { key: d.key, icon: d.icon || 'spark', title: str(d.title) || d.key, order: num(d.order, 50), run: d.run }, d.key);
+  };
+  /** {key, order, span:4|5|6|7|8|12, title, sub? (string or fn(ctx)), render(el, ctx)} — ctx: {jobs, ats, stats, actions, cleanup(fn)} */
+  CB.registerDashCard = (d) => {
+    if (!d || !KEY_RE.test(String(d.key || ''))) return bad('registerDashCard', 'key must be letters, digits, - or _', d);
+    if (typeof d.render !== 'function') return bad('registerDashCard', 'render(el, ctx) is required', d);
+    const span = [4, 5, 6, 7, 8, 12].includes(+d.span) ? +d.span : 6;
+    return addReg('dashCards', 'dashCard', { key: d.key, order: num(d.order, 50), span, title: str(d.title), sub: d.sub, render: d.render }, d.key);
+  };
+  /** {label, k?, run, key?} — ⌘K palette entry */
+  CB.registerCommand = (d) => {
+    if (!d || !str(d.label)) return bad('registerCommand', 'label is required', d);
+    if (typeof d.run !== 'function') return bad('registerCommand', 'run() is required', d);
+    return addReg('commands', 'command', { key: str(d.key), label: str(d.label), k: str(d.k), order: num(d.order, 50), run: d.run }, str(d.key) || str(d.label));
+  };
+  /** fn(jobs, settings, atsById) → [action] — extra Action Center items (same shape as CB.Auto). */
+  CB.registerAction = (fn) => {
+    if (typeof fn !== 'function') return bad('registerAction', 'expects a function', fn);
+    const ex = REG.actions.find((x) => x.fn === fn);
+    if (ex) return () => { const k = REG.actions.indexOf(ex); if (k >= 0) { REG.actions.splice(k, 1); CB.emit('registry', { kind: 'action', key: ex._id, removed: true }); } };
+    return addReg('actions', 'action', { fn, order: 50 }, 'action' + (regSeq + 1));
+  };
+  /** {key, title, order, span?, render(el)} — extra Settings cards */
+  CB.registerSettings = (d) => {
+    if (!d || !KEY_RE.test(String(d.key || ''))) return bad('registerSettings', 'key must be letters, digits, - or _', d);
+    if (typeof d.render !== 'function') return bad('registerSettings', 'render(el) is required', d);
+    const span = [4, 5, 6, 7, 8, 12].includes(+d.span) ? +d.span : 6;
+    return addReg('settings', 'settings', { key: d.key, title: str(d.title), order: num(d.order, 50), span, render: d.render }, d.key);
+  };
 })();

@@ -20,6 +20,7 @@
     else if (a.action.type === 'move') UI().moveJob(a.jobId, a.action.to, { auto: true, note: 'From Action Center' });
     else if (a.action.type === 'followup') UI().logFollowUp(a.jobId);
     else if (a.action.type === 'thanks') { S.update(a.jobId, (x) => { const iv = x.interviews.find((i) => i.id === a.ivId); if (iv) { iv.thankYouSent = true; if (iv.outcome === 'Scheduled') iv.outcome = 'Completed'; } x.timeline.push({ id: CB.uid('t_'), ts: CB.nowISO(), kind: 'followup', text: 'Thank-you note sent' }); }, { undoLabel: 'Thank-you' }); UI().toast('Thank-you logged', { undo: true }); }
+    else if (UI().runCustomAction) UI().runCustomAction(a); // platform hook: CB.registerAction items with action.run
   }
 
   // ═════════════════════════ DASHBOARD ═════════════════════════
@@ -37,18 +38,46 @@
 
     if (!jobs.length) {
       root.innerHTML = `<div class="empty card" style="max-width:720px;margin:20px auto">
+        <svg class="empty-mark" viewBox="0 0 56 56" aria-hidden="true"><circle cx="28" cy="28" r="27" fill="none" stroke="url(#cb-metal)" stroke-width="1"/><circle cx="28" cy="28" r="22.5" fill="none" stroke="url(#cb-metal)" stroke-width=".6" opacity=".5"/><path d="M37.3 18.6a13.2 13.2 0 1 0 0 18.8" fill="none" stroke="url(#cb-metal)" stroke-width="2.2" stroke-linecap="round"/><circle cx="37.8" cy="28" r="1.8" fill="url(#cb-metal)"/></svg>
+        <div class="hero-eyebrow" style="justify-content:center">A private office for your search</div>
         <h3>Start tracking your search</h3>
         <p class="muted" style="max-width:52ch">Paste a LinkedIn link and the posting text, and Callback extracts the details, scores it against your resume with a strict ATS, and tracks it from Applied to Offer.</p>
         <div class="row" style="justify-content:center"><button class="btn btn-accent" data-add>${UI().icon('plus')}Add your first job</button><a class="btn" href="#ats">${UI().icon('upload')}Upload resume</a><button class="btn" data-ex>Load example data</button><a class="btn" href="#reports">Import from Excel</a></div>
       </div>`;
       $('[data-add]', root).onclick = () => UI().addJob();
       $('[data-ex]', root).onclick = () => { const n = S.loadSamples(); UI().toast(`Loaded ${n} example applications`); };
+      if (UI().mountDashCards) UI().mountDashCards(root.firstElementChild, { jobs, ats, stats: st, actions: acts }); // platform hook: CB.registerDashCard
       return;
     }
-    const kpi = (label, value, sub, extra = '') => `<div class="card kpi">${extra}<div class="kpi-l">${label}</div><div class="kpi-v">${value}</div><div class="kpi-d">${sub}</div></div>`;
+    const kpi = (label, value, sub, extra = '') => `<div class="card kpi${/^Offers/.test(label) && st.offers ? ' is-gold' : ''}">${extra}<div class="kpi-l">${label}</div><div class="kpi-v" data-count="${E(label)}">${value}</div><div class="kpi-d">${sub}</div></div>`;
+    // Hero: editorial greeting + one-line status summary (design)
+    const now = new Date();
+    const hr = now.getHours();
+    const greet = hr >= 5 && hr < 12 ? 'Good morning' : hr >= 12 && hr < 17 ? 'Good afternoon' : 'Good evening';
+    let who = '';
+    try { who = String(S.settings.candidateName || (S.profile() && S.profile().name) || '').trim().split(/\s+/)[0] || ''; } catch (e) { who = ''; }
+    if (who.length > 18) who = '';
+    const wk = (() => { const d = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())); const day = d.getUTCDay() || 7; d.setUTCDate(d.getUTCDate() + 4 - day); return Math.ceil(((d - Date.UTC(d.getUTCFullYear(), 0, 1)) / 864e5 + 1) / 7); })();
+    const dateLine = now.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+    const urgent = acts.filter((a) => a.sev === 1).length;
+    const ivSoon = upcoming.filter((u) => u.d < new Date(Date.now() + 7 * 864e5)).length;
+    const parts = [`<b>${st.active}</b> active application${st.active === 1 ? '' : 's'}`];
+    if (ivSoon) parts.push(`<b>${ivSoon}</b> interview${ivSoon === 1 ? '' : 's'} this week`);
+    else if (upcoming.length) parts.push(`next interview ${E(CB.relDays ? CB.relDays(CB.toISODate(upcoming[0].d)) : '')}`.trim());
+    if (st.offers) parts.push(`<b class="gold">${st.offers} offer${st.offers === 1 ? '' : 's'}</b> on the table`);
+    const summary = parts.length > 1 ? parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1] : parts[0];
+    const tail = urgent ? ` <b>${urgent}</b> thing${urgent === 1 ? '' : 's'} need${urgent === 1 ? 's' : ''} you today.` : ' Nothing urgent today.';
+    const wkPct = Math.min(100, Math.round((st.thisWeek / Math.max(1, goal)) * 100));
+    const hero = `<section class="hero" aria-label="Summary">
+        <div><div class="hero-eyebrow">${E(dateLine)} · Week ${wk}</div>
+          <h2>${greet}${who ? `, <em>${E(who)}</em>` : ''}.</h2>
+          <p class="hero-sum">You have ${summary}.${tail}</p></div>
+        <div class="hero-week" title="Applications this week vs. your goal"><div class="hero-week-l"><span>This week</span><b class="num">${st.thisWeek}<small>/${goal}</small></b></div><div class="hero-week-bar"><i style="width:${wkPct}%"></i></div></div>
+      </section>`;
     root.innerHTML = `
       ${samples ? `<div class="banner"><span><b>${samples} example applications</b> and ${S.resume && S.resume.sample ? 'an example resume are' : 'are'} loaded so you can see everything working. They are fictional.</span><div class="row"><a class="btn btn-sm" href="#ats">Upload my resume</a><button class="btn btn-sm btn-primary" data-clear-ex>Clear examples</button></div></div>` : ''}
       <div class="dash">
+        ${hero}
         <div class="kpis">
           ${kpi('Applications sent', st.applied, `${st.thisWeek} this week · goal ${goal}${st.thisWeek - prevWeek ? ` · <span class="${st.thisWeek >= prevWeek ? 'delta-up' : 'delta-down'}">${st.thisWeek >= prevWeek ? '+' : ''}${st.thisWeek - prevWeek} vs last wk</span>` : ''}`, '<div data-spark></div>')}
           ${kpi('Response rate', CB.pct(st.responseRate), `${st.responses} replied${st.medianDaysToResponse != null ? ` · median ${st.medianDaysToResponse}d` : ''}`)}
@@ -68,11 +97,11 @@
             <div style="display:grid;gap:6px;font-size:13px"><div><b style="font-size:15px">${st.thisWeek} of ${goal}</b> applications</div><div class="muted">${Math.max(0, goal - st.thisWeek)} to go · ${Math.max(0, 7 - ((new Date().getDay() + 6) % 7) - 1)} days left in the week</div><div class="muted">Average reply ${st.avgDaysToResponse != null ? Math.round(st.avgDaysToResponse) + ' days' : '—'} after applying</div></div>
           </div>
           <div style="margin-top:14px" id="heat"></div></section>
-        <section class="card span-6"><div class="card-h"><h3>Applications per week</h3><span class="sub">Last 12 weeks vs. your goal</span></div><div id="weekly"></div></section>
-        <section class="card span-6"><div class="card-h"><h3>Response rate by source</h3><span class="sub">Any reply, including rejections</span></div><div id="sources"></div></section>
-        <section class="card span-6"><div class="card-h"><h3>Upcoming interviews</h3><span class="sub">Next 3 weeks</span></div>
+        <section class="card span-8"><div class="card-h"><h3>Applications per week</h3><span class="sub">Last 12 weeks vs. your goal</span></div><div id="weekly"></div></section>
+        <section class="card span-4"><div class="card-h"><h3>Response rate by source</h3><span class="sub">Any reply, including rejections</span></div><div id="sources"></div></section>
+        <section class="card span-5"><div class="card-h"><h3>Upcoming interviews</h3><span class="sub">Next 3 weeks</span></div>
           ${upcoming.length ? `<div style="display:grid;gap:8px">${upcoming.slice(0, 6).map(({ j, iv, d }) => `<button class="iv" style="text-align:left;cursor:pointer;width:100%" data-job="${j.id}"><div class="iv-date"><span>${CB.MONTHS[d.getMonth()]}</span><b>${d.getDate()}</b></div><div style="min-width:0"><b class="ell" style="display:block">${E(j.company)} · ${E(iv.type)}</b><span class="muted" style="font-size:12.5px">${E(CB.fmtDateTime(iv.datetime))}${iv.interviewer ? ' · ' + E(iv.interviewer) : ''}</span></div>${UI().chip(j.status)}</button>`).join('')}</div>` : '<p class="empty-note">No interviews booked. Log them from an application’s Interviews tab or paste the invite in the Inbox Parser.</p>'}</section>
-        <section class="card span-6"><div class="card-h"><h3>Where everything stands</h3><span class="sub">${jobs.length} tracked</span></div><div id="mix"></div>
+        <section class="card span-7"><div class="card-h"><h3>Where everything stands</h3><span class="sub">${jobs.length} tracked</span></div><div id="mix"></div>
           <div class="lbl" style="margin:16px 0 8px">Rejections by stage</div><div id="rej"></div></section>
       </div>`;
     const clr = $('[data-clear-ex]', root);
@@ -81,9 +110,9 @@
     $$('[data-open]', root).forEach((b) => (b.onclick = () => { const a = acts[+b.dataset.open]; UI().openJob(a.jobId, a.action.tab || 'overview'); }));
     $$('[data-job]', root).forEach((b) => (b.onclick = () => UI().openJob(b.dataset.job, 'interviews')));
     CB.Charts.spark($('[data-spark]', root), st.weekly.map((w) => w.value));
-    CB.Charts.ring($('#goal-ring', root), st.thisWeek / goal, { label: `${Math.round(Math.min(1, st.thisWeek / goal) * 100)}%`, sub: 'weekly goal', size: 118, stroke: 10, color: 'color-mix(in srgb, var(--accent) 80%, var(--ink) 20%)' });
+    CB.Charts.ring($('#goal-ring', root), st.thisWeek / goal, { label: `${Math.round(Math.min(1, st.thisWeek / goal) * 100)}%`, sub: 'weekly goal', size: 118, stroke: 10 });
     CB.Charts.heatmap($('#heat', root), st.daily, { weeks: 20 });
-    CB.Charts.columns($('#weekly', root), st.weekly, { goal, unit: 'applications', highlightLast: true });
+    CB.Charts.columns($('#weekly', root), st.weekly, { goal, unit: 'applications', highlightLast: true, height: 260 });
     CB.Charts.rateBars($('#sources', root), st.bySource.map((s) => ({ label: s.source, sub: `${s.responses}/${s.applied} replied · ${s.interviews} interviews`, value: s.rate || 0, tip: `<b>${E(s.source)}</b><br>${s.applied} applied · ${s.responses} replies · ${s.interviews} interviews` })), { max: 1 });
     CB.Charts.flow($('#flow', root), jobs);
     CB.Charts.segBar($('#mix', root), CB.STAGES.map((s) => ({ label: s.label, value: st.byStage[s.key] || 0, color: `var(--st-${s.key})`, ink: s.ink })));
@@ -104,6 +133,7 @@
     }
     if (!persist.funnel) CB.Charts.funnel2d(persist.towerHost, stages);
     onLeave('dashboard', () => { if (persist.funnel) { persist.funnel.destroy(); persist.funnel = null; } persist.towerHost = null; });
+    if (UI().mountDashCards) UI().mountDashCards($('.kpis', root), { jobs, ats, stats: st, actions: acts }); // platform hook: CB.registerDashCard
   };
 
   // ═════════════════════════ BOARD ═════════════════════════
@@ -251,7 +281,7 @@
       { k: 'company', l: 'Company', t: 'text', fz: true, w: 150 },
       { k: 'title', l: 'Title', t: 'text', w: 220 },
       { k: 'status', l: 'Status', t: 'status', w: 140, get: (j) => CB.STAGE[j.status].label, html: (j) => UI().chip(j.status) },
-      { k: 'ats', l: 'ATS', t: 'ro', num: true, w: 60, get: (j) => A(j).score ?? '', style: (j) => { const s = A(j).score; if (s == null) return ''; const hue = Math.round(CB.clamp((s - 35) / 60, 0, 1) * 125); return `background:hsl(${hue} 70% 50% / .22)`; } },
+      { k: 'ats', l: 'ATS', t: 'ro', num: true, w: 60, get: (j) => A(j).score ?? '', style: (j) => { const a = A(j); if (a.score == null) return ''; const c = UI().scoreColor(a.score, a); return `background:color-mix(in srgb, ${c} 9%, var(--surface-1));color:color-mix(in oklab, ${c} 80%, var(--ink-1))`; } },
       { k: 'chance', l: 'Chance', t: 'ro', num: true, w: 70, get: (j) => (A(j).probability != null ? Math.round(A(j).probability * 1000) / 10 : ''), fmt: (v) => (v === '' ? '' : v >= 100 ? 'Reached' : v + '%') },
       { k: 'verdict', l: 'Verdict', t: 'ro', w: 120, get: (j) => A(j).verdictLabel || '', html: (j) => (A(j).verdict && A(j).score != null ? UI().stamp(A(j)) : '') },
       { k: 'appliedDate', l: 'Applied', t: 'date', w: 110, fmt: (v) => (v ? CB.fmtDate(v, true) : '') },
@@ -888,7 +918,7 @@ Cobalt AI Recruiting`,
   V.settings = (root) => {
     const s = S.settings;
     let theme = 'system';
-    try { theme = localStorage.getItem('callback.theme') || 'system'; } catch (e) { /* noop */ }
+    try { theme = localStorage.getItem('callback.theme') || 'dark'; } catch (e) { /* noop */ }
     const p = S.profile();
     root.innerHTML = `<div class="dash">
       <section class="card span-6"><div class="card-h"><h3>Eligibility</h3><span class="sub">Used for knockout questions — answer honestly</span></div>
@@ -904,7 +934,7 @@ Cobalt AI Recruiting`,
           </div>
         </div></section>
       <section class="card span-6"><div class="card-h"><h3>ATS strictness</h3></div>
-        <div style="display:grid;gap:10px">${Object.entries(CB.ATS.STRICT).map(([k, v]) => `<label class="check" style="padding:10px;border:1px solid ${s.strictness === k ? 'var(--ink)' : 'var(--line)'};border-radius:10px"><input type="radio" name="strict" value="${k}" ${s.strictness === k ? 'checked' : ''}><span><b>${E(v.label)}</b>${k === 'brutal' ? ' <span class="tag">Default</span>' : ''}<br><span class="muted" style="font-size:12.5px">Cutoff ${v.floor} · review ${v.competitive}+ · must-haves ≥ ${Math.round(v.koMQ * 100)}% · years ≥ ${Math.round(v.koYoeRatio * 100)}% of minimum · listed-only skills ${Math.round(v.listedCredit * 100)}% credit${v.koDegreeGap === 1 ? ' · degree gaps knock out' : ''}${v.koLocation ? ' · location knocks out' : ''}</span></span></label>`).join('')}</div></section>
+        <div style="display:grid;gap:10px">${Object.entries((CB.ATS && CB.ATS.STRICT) || {}).map(([k, v]) => `<label class="check opt-card${s.strictness === k ? ' is-on' : ''}"><input type="radio" name="strict" value="${k}" ${s.strictness === k ? 'checked' : ''}><span><b>${E(v.label)}</b>${k === 'brutal' ? ' <span class="tag">Default</span>' : ''}<br><span class="muted" style="font-size:12.5px">Cutoff ${v.floor} · review ${v.competitive}+ · must-haves ≥ ${Math.round(v.koMQ * 100)}% · years ≥ ${Math.round(v.koYoeRatio * 100)}% of minimum · listed-only skills ${Math.round(v.listedCredit * 100)}% credit${v.koDegreeGap === 1 ? ' · degree gaps knock out' : ''}${v.koLocation ? ' · location knocks out' : ''}</span></span></label>`).join('')}</div></section>
       <section class="card span-6"><div class="card-h"><h3>Goals &amp; automations</h3></div>
         <div class="grid3">
           <label class="field"><span>Weekly application goal</span><input class="input" type="number" data-s="weeklyGoal" value="${E(s.weeklyGoal)}"></label>
@@ -921,7 +951,8 @@ Cobalt AI Recruiting`,
       <section class="card span-6"><div class="card-h"><h3>Appearance</h3></div>
         <div class="seg-ctl" role="group" aria-label="Theme">${[['system', 'Match system'], ['light', 'Light'], ['dark', 'Dark']].map(([k, l]) => `<button data-theme-set="${k}" aria-pressed="${theme === k}">${l}</button>`).join('')}</div>
         <label class="check" style="margin-top:14px"><input type="checkbox" id="st-cal" ${(() => { try { return localStorage.getItem('callback.cal.hidden') === '1' ? '' : 'checked'; } catch (e) { return 'checked'; } })()}><span><b>Show Cal, the assistant</b><br><span class="muted" style="font-size:12.5px">Press C anywhere (Mac) to call Cal even when hidden.</span></span></label>
-        <p class="muted" style="font-size:12.5px;margin:12px 0 0">${CB.standalone ? 'On iPhone: open the app in Safari, tap Share → Add to Home Screen. On Mac: open it in Safari and choose File → Add to Dock, or in Chrome choose Install. It then works offline.' : 'On iPhone: open this page in Safari, tap Share → Add to Home Screen for an app icon. On Mac: keep it pinned in claude.ai, or add it to the Dock from Safari (File → Add to Dock).'}</p></section>
+        <label class="check" style="margin-top:12px"><input type="checkbox" data-fx-reduce ${(() => { try { return localStorage.getItem('callback.reduceFx') === '1' ? 'checked' : ''; } catch (e) { return ''; } })()}><span><b>Reduce glass and motion</b><br><span class="muted" style="font-size:12.5px">Opaque panels and instant transitions. Easier on older iPhones and on the eyes.</span></span></label>
+        <p class="muted" style="font-size:12.5px;margin:12px 0 0">${CB.standalone ? 'On iPhone: open the app in Safari, tap Share → Add to Home Screen. On Mac: open it in Safari and choose File → Add to Dock, or in Chrome choose Install. It then works offline.' : 'On Mac or Windows: open Callback in the Claude desktop app and choose Share → Install as app for its own window, menu bar and reminders (Settings → Desktop app). On iPhone: open it in the Claude app, or use the web version from your Home Screen.'}</p></section>
       <section class="card span-6"><div class="card-h"><h3>Your data</h3><span class="sub">${S.mode === 'cloud' ? 'Synced to your claude.ai account — private to you' : 'Stored in this browser only'}</span></div>
         <div class="row">
           <button class="btn" id="st-ex-load">Load examples</button>
@@ -948,6 +979,7 @@ Cobalt AI Recruiting`,
     $('#st-wipe', root).onclick = async () => {
       if (await UI().confirm({ title: 'Delete everything?', text: `All ${S.list().length} applications and your resume will be permanently removed from every device. Export a backup first if you might want them.`, ok: 'Delete everything', danger: true })) { S.clearAll(); UI().toast('All data deleted'); }
     };
+    if (UI().mountSettingsCards) UI().mountSettingsCards($('.dash', root)); // platform hook: CB.registerSettings
   };
 
   CB.Views = V;

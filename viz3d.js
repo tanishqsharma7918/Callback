@@ -1,6 +1,8 @@
-/* Callback — 3D visualizations (Three.js r128 through the global THREE; no addons).
+/* Callback v3 — 3D visualisations on the shared GL hub.  Owner: scenes.  Contract: docs/BUILD.md §2,
+ * art direction: docs/research/premium-3d.md ("an orrery in a black vitrine").
  *
- *   CB.Viz3D.available() → boolean (THREE present + a WebGL context can be created)
+ *   CB.Viz3D.available() → boolean   CB.GL.available(): the ONE shared WebGL context. false in Safe Mode / without
+ *                                    WebGL, so callers fall back to their 2D charts. No probe contexts.
  *
  *   CB.Viz3D.createFunnel(container, { stages, dropoffs, theme, onPick })
  *     → { update(stages, dropoffs, theme), destroy() } | null                       "Pipeline Tower"
@@ -8,32 +10,46 @@
  *   CB.Viz3D.createGalaxy(container, { points, theme, thresholds, onSelect, onOpen, onPick })
  *     → { update(points, theme, opts), select(id), highlight(id|null), destroy() } | null   "Opportunity Space"
  *
- * Look: studio PMREM environment built from emissive softboxes (same recipe as mascot.js), ACES filmic
- * tone mapping, sRGB output, clearcoat physical materials, contact shadow — on a transparent canvas.
- * Cost: rendering runs only while the container is on screen and the page is visible. Ambient motion is
- * capped at 30 fps, interaction and tweens run at full rate, and the loop stops when nothing animates
- * (reduced motion, or the galaxy with auto-rotate off and 2 s without interaction).
+ * Engine: this file never creates a WebGLRenderer, a PMREMGenerator or a probe context. Each scene is a CB.GL.view
+ * (the hub renders offscreen and blits into a 2D canvas inside the host) lit by the hub's shared studio environment
+ * (CB.GL.env) with every colour converted sRGB → linear. Pacing follows the hub: 0 fps idle, 30 fps ambient for at
+ * most 4 s after input, native rate only while dragging or while a tween runs (view.kick). Data refreshes mutate the
+ * scene in place (the view is never rebuilt); destroy() frees every GPU resource through view.dispose().
+ *
+ * Look — Pipeline Tower: jewel-tinted fake-crystal tiers (clearcoat + fresnel rim, champagne bezels) threaded on a
+ * champagne spindle above a black-lacquer plinth with a champagne bezel and an engraved dial, gold glow sprites,
+ * contact shadows, a disc-clipped mirror reflection, instanced glossy beads spiralling down the spindle while
+ * drop-offs roll off the tiers and arc away, three depth layers of slow dust, depth fog.
+ * Opportunity Space: jewel-ink instanced spheres in a lacquer-floored vitrine with an engraved champagne grid,
+ * champagne threshold planes and "Apply now" zone, gold halo on the selection, depth fog, dust.
+ * Narrow FOV (30–32°), pointer parallax on Mac (±3.5°), entry choreography: CSS poster → compile → first frame →
+ * 600 ms cross-fade (hub) + an 8 % camera dolly (here). Labels, toolbar and cards are DOM overlays.
  */
 (function () {
   'use strict';
   const CB = (window.CB = window.CB || {});
 
   // ───────── constants & small helpers ─────────
-  const DEFAULT_THEME = { fg: '#14171f', muted: '#6b7280', grid: '#d9dce3', surface: '#ffffff', accent: '#c9a400' };
+  const DEFAULT_THEME = { fg: '#F2EEE6', muted: '#8B867D', grid: '#34332F', surface: '#131312', accent: '#D8BA7E' };
   const DROP = [
-    { key: 'rejected', label: 'rejected', color: '#e34948' },
-    { key: 'ghosted', label: 'ghosted', color: '#5d6470' },
-    { key: 'withdrawn', label: 'withdrawn', color: '#a39e93' },
+    { key: 'rejected', label: 'rejected', color: '#D0656F' },
+    { key: 'ghosted', label: 'ghosted', color: '#6A6966' },
+    { key: 'withdrawn', label: 'withdrawn', color: '#9A8F80' },
   ];
   const CLOSED = ['rejected', 'ghosted', 'withdrawn'];
-  const KNOCK_COLOR = '#e34948';
+  let KNOCK_COLOR = '#D0656F';
   const VERDICTS = {
-    STRONG: ['Shortlist', '#0ca30c'],
-    COMPETITIVE: ['Advance to review', '#eda100'],
-    LONG_SHOT: ['Long shot', '#eb6834'],
-    REJECTED: ['Auto-rejected', '#e34948'],
+    STRONG: ['Shortlist', '#6FB58A'],
+    COMPETITIVE: ['Advance to review', '#D8BA7E'],
+    LONG_SHOT: ['Long shot', '#D98B5F'],
+    REJECTED: ['Auto-rejected', '#D0656F'],
   };
   const VERDICT_ORDER = ['STRONG', 'COMPETITIVE', 'LONG_SHOT', 'REJECTED'];
+  /** Scene palette per theme ("Obsidian & Champagne" / "Ivory & Bronze", luxury-ui.md). */
+  const PAL = {
+    dark: { metal: '#D9BC85', engrave: '#D8BA7E', lacquer: '#0C0C0B', bead: '#EEDDB4', glow: '#E8D3A4', rim: '#E8D3A4', axis: '#8B867D' },
+    light: { metal: '#C4A36A', engrave: '#86662B', lacquer: '#D9D2C3', bead: '#8C6A2E', glow: '#C29E5E', rim: '#8C6A2E', axis: '#6B655A' },
+  };
   const DEG = Math.PI / 180;
   const TAU = Math.PI * 2;
   const COLOR_RE = /^(#[0-9a-f]{3}|#[0-9a-f]{6}|rgba?\([^)]*\)|hsla?\([^)]*\))$/i;
@@ -50,6 +66,28 @@
     return isFinite(n) ? n : d === undefined ? 0 : d;
   };
   const esc = (s) => str(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  let normCtx = null;
+  /** A design token from :root as a plain CSS colour ('' when missing). Tokens may be oklch()/color-mix(), so they
+   *  are normalised through a 1×1 2D context. */
+  function cssVar(name) {
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      if (!v) return '';
+      if (isColor(v)) return v;
+      if (!normCtx) { const c = document.createElement('canvas'); c.width = c.height = 1; normCtx = c.getContext('2d'); }
+      if (!normCtx) return '';
+      normCtx.fillStyle = '#000';
+      normCtx.fillStyle = v;
+      const out = String(normCtx.fillStyle);
+      return isColor(out) ? out : '';
+    } catch (e) { return ''; }
+  }
+  const dropColor = (k) => cssVar('--st-' + DROP[k].key) || DROP[k].color;
+  function mixHex(a, b, t) {
+    const ca = colorOf(a), cb = colorOf(b);
+    ca.lerp(cb, t);
+    return '#' + ca.getHexString();
+  }
 
   function normTheme(t, prev) {
     const base = prev || DEFAULT_THEME;
@@ -90,100 +128,126 @@
     close: '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   };
 
-  // ───────── availability (WebGL probe cached; THREE checked live so a lazy load still works) ─────────
-  let glProbe = null;
+  // ───────── availability: the shared hub decides (no probe contexts, no second renderer) ─────────
+  function GLH() {
+    return CB.GL && typeof CB.GL.view === 'function' && typeof CB.GL.available === 'function' ? CB.GL : null;
+  }
   function available() {
-    if (typeof THREE === 'undefined' || !THREE.WebGLRenderer) return false;
-    if (glProbe === null) {
-      glProbe = false;
-      try {
-        const c = document.createElement('canvas');
-        const gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
-        if (gl) {
-          glProbe = true;
-          const lose = gl.getExtension('WEBGL_lose_context');
-          if (lose) lose.loseContext();
-        }
-      } catch (e) {
-        glProbe = false;
-      }
-    }
-    return glProbe;
+    const G = GLH();
+    if (!G || typeof THREE === 'undefined' || !THREE.Scene) return false;
+    try { return !!G.available(); } catch (e) { return false; }
+  }
+  function safeQuality(G) {
+    try { return (G && G.quality && G.quality()) || {}; } catch (e) { return {}; }
   }
 
   // ───────── shared stylesheet (ref-counted) ─────────
+  const F_UI = "var(--f-ui,'Geist',Inter,system-ui,-apple-system,sans-serif)";
+  const F_MONO = "var(--f-mono,'Geist Mono',ui-monospace,'SF Mono',Menlo,monospace)";
+  const F_DISP = "var(--f-display,'Bodoni Moda',Didot,'Bodoni 72',Georgia,serif)";
+  const EZ = 'cubic-bezier(.2,.8,.2,1)';
   const CSS = [
-    '.cb3d-canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block;touch-action:pan-y;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;outline:none;cursor:grab}',
+    '.cb3d-host{isolation:isolate}',
+    '.cb3d-canvas{-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;outline:none;cursor:grab}',
     '.cb3d-canvas.is-drag{cursor:grabbing}',
     '.cb3d-canvas.is-hot{cursor:pointer}',
-    '.cb3d-ov{position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none;overflow:hidden;font:500 12px Inter,system-ui,sans-serif;color:var(--cb3d-fg);-webkit-font-smoothing:antialiased;-webkit-user-select:none;user-select:none;text-align:left;letter-spacing:normal}',
+    // overlay: tokens with fallbacks so the scene reads right before and after the v3 stylesheet lands
+    '.cb3d-ov{--cb3d-line:var(--line-2,rgba(128,120,104,.22));--cb3d-line-s:var(--line-1,rgba(128,120,104,.12));--cb3d-rim:var(--rim,rgba(255,250,240,.07));' +
+      'position:absolute;left:0;top:0;right:0;bottom:0;z-index:2;pointer-events:none;overflow:hidden;font:450 12px/1.3 ' + F_UI + ';color:var(--cb3d-fg);' +
+      '-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;-webkit-user-select:none;user-select:none;text-align:left;letter-spacing:.003em;transition:opacity .4s ' + EZ + ',visibility 0s}',
+    '.cb3d-ov.is-safe{opacity:0;visibility:hidden;transition:opacity .2s linear,visibility 0s linear .2s}',
     '.cb3d-ov *{box-sizing:border-box}',
-    '.cb3d-chip{position:absolute;left:0;top:0;display:flex;align-items:center;gap:5px;height:20px;padding:0 7px;border-radius:6px;background:var(--cb3d-panel);border:1px solid var(--cb3d-line);color:var(--cb3d-fg);white-space:nowrap;line-height:18px;font-variant-numeric:tabular-nums;transition:opacity .2s ease,border-color .15s ease;will-change:transform}',
+    // tower labels
+    '.cb3d-chip{position:absolute;left:0;top:0;display:flex;align-items:center;gap:6px;height:24px;padding:0 9px 0 8px;border-radius:8px;background:var(--cb3d-panel);border:1px solid var(--cb3d-line);' +
+      'box-shadow:inset 0 1px 0 var(--cb3d-rim),0 8px 18px -12px var(--cb3d-shadow);color:var(--cb3d-fg);white-space:nowrap;line-height:22px;font-variant-numeric:tabular-nums;' +
+      'transition:opacity .3s ' + EZ + ',border-color .2s ease,background-color .2s ease;will-change:transform}',
     '.cb3d-chip.is-pick{pointer-events:auto;cursor:pointer}',
-    '.cb3d-chip.is-hot{border-color:var(--cb3d-muted)}',
-    '.cb3d-chip:focus-visible{outline:2px solid var(--cb3d-accent);outline-offset:1px}',
-    '.cb3d-chip b{font-weight:700;flex:none}',
-    '.cb3d-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex:none}',
-    '.cb3d-nm{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}',
-    '.cb3d-mu{color:var(--cb3d-muted);flex:none}',
-    '.cb3d-sep{color:var(--cb3d-muted);flex:none}',
-    '.cb3d-lead{position:absolute;left:0;top:0;height:1px;width:10px;background:var(--cb3d-lead);transform-origin:0 0;transition:opacity .2s ease}',
-    '.cb3d-tick{position:absolute;left:0;top:0;font-size:11px;line-height:14px;color:var(--cb3d-muted);white-space:nowrap;font-variant-numeric:tabular-nums;text-shadow:0 0 2px var(--cb3d-surface),0 0 4px var(--cb3d-surface),0 0 6px var(--cb3d-surface);transition:opacity .2s ease}',
-    '.cb3d-tick.is-title{color:var(--cb3d-fg);font-weight:600}',
+    '.cb3d-chip.is-hot{border-color:var(--cb3d-gold-line);background:var(--cb3d-tip)}',
+    '.cb3d-chip:focus{outline:none}',
+    '.cb3d-chip:focus-visible{box-shadow:0 0 0 2px var(--cb3d-surface),0 0 0 4px var(--cb3d-focus)}',
+    '.cb3d-chip b{font:600 12px/1 ' + F_MONO + ';flex:none;letter-spacing:-.01em;color:var(--cb3d-fg)}',
+    '.cb3d-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex:none;box-shadow:0 0 0 1px var(--cb3d-dot-ring),inset 0 1px 1px rgba(255,255,255,.28)}',
+    '.cb3d-nm{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto;color:var(--cb3d-fg2)}',
+    '.cb3d-mu{color:var(--cb3d-muted);flex:none;font:500 11px/1 ' + F_MONO + ';letter-spacing:-.01em}',
+    '.cb3d-sep{color:var(--cb3d-muted);flex:none;opacity:.55}',
+    '.cb3d-lead{position:absolute;left:0;top:0;height:1px;width:10px;background:linear-gradient(90deg,var(--cb3d-lead0),var(--cb3d-lead));transform-origin:0 0;transition:opacity .3s ' + EZ + '}',
+    // axis ticks
+    '.cb3d-tick{position:absolute;left:0;top:0;font:500 10.5px/14px ' + F_MONO + ';letter-spacing:-.01em;color:var(--cb3d-muted);white-space:nowrap;font-variant-numeric:tabular-nums;' +
+      'text-shadow:0 0 2px var(--cb3d-surface),0 0 5px var(--cb3d-surface),0 0 9px var(--cb3d-surface);transition:opacity .3s ' + EZ + '}',
+    '.cb3d-tick.is-title{font:600 9.5px/14px ' + F_UI + ';letter-spacing:.14em;text-transform:uppercase;color:var(--cb3d-fg2)}',
     '.cb3d-off{opacity:0 !important;pointer-events:none !important}',
-    '.cb3d-tip{position:absolute;left:0;top:0;max-width:240px;padding:8px 10px;border-radius:9px;background:var(--cb3d-tip);border:1px solid var(--cb3d-line);color:var(--cb3d-fg);box-shadow:0 8px 24px var(--cb3d-shadow);line-height:1.45;opacity:0;transition:opacity .12s ease;white-space:normal;font-variant-numeric:tabular-nums}',
+    // tooltip
+    '.cb3d-tip{position:absolute;left:0;top:0;max-width:250px;padding:9px 12px 10px;border-radius:11px;background:var(--cb3d-tip);border:1px solid var(--cb3d-line);' +
+      'box-shadow:inset 0 1px 0 var(--cb3d-rim),0 22px 48px -22px var(--cb3d-shadow);color:var(--cb3d-fg2);line-height:1.5;opacity:0;transition:opacity .16s ease;white-space:normal;font-variant-numeric:tabular-nums}',
     '.cb3d-tip.is-on{opacity:1}',
-    '.cb3d-tip b,.cb3d-card b{font-weight:700}',
-    '.cb3d-t1{font-weight:700}',
+    '.cb3d-tip b,.cb3d-card b{font-family:' + F_MONO + ';font-weight:600;color:var(--cb3d-fg);letter-spacing:-.01em}',
+    '.cb3d-t1{font-weight:600;color:var(--cb3d-fg)}',
+    '.cb3d-tip .cb3d-t1{font-size:12.5px}',
     '.cb3d-t2{color:var(--cb3d-muted)}',
     '.cb3d-row{display:flex;align-items:center;gap:6px;min-width:0}',
-    '.cb3d-msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:8px 12px;border-radius:9px;background:var(--cb3d-panel);border:1px solid var(--cb3d-line);color:var(--cb3d-muted);white-space:nowrap}',
-    '.cb3d-legend{position:absolute;right:10px;top:8px;display:flex;align-items:center;gap:10px;font-size:11px;line-height:14px;color:var(--cb3d-muted);white-space:nowrap;text-shadow:0 0 3px var(--cb3d-surface),0 0 5px var(--cb3d-surface)}',
-    '.cb3d-legend.is-col{top:auto;bottom:8px;flex-direction:column;align-items:flex-start;gap:2px}',
-    '.cb3d-legend span{display:inline-flex;align-items:center;gap:4px}',
+    '.cb3d-msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:10px 16px;border-radius:11px;background:var(--cb3d-panel);border:1px solid var(--cb3d-line);' +
+      'box-shadow:inset 0 1px 0 var(--cb3d-rim);color:var(--cb3d-muted);white-space:nowrap}',
+    '.cb3d-legend{position:absolute;right:10px;top:8px;display:flex;align-items:center;gap:12px;font-size:11px;line-height:14px;color:var(--cb3d-muted);white-space:nowrap;' +
+      'font-variant-numeric:tabular-nums;text-shadow:0 0 3px var(--cb3d-surface),0 0 6px var(--cb3d-surface)}',
+    '.cb3d-legend.is-col{top:auto;bottom:8px;flex-direction:column;align-items:flex-start;gap:3px}',
+    '.cb3d-legend span{display:inline-flex;align-items:center;gap:5px}',
     // galaxy toolbar
     '.cb3d-bar{position:absolute;left:10px;top:10px;display:flex;flex-wrap:wrap;align-items:center;gap:6px;pointer-events:auto;max-width:calc(100% - 20px)}',
     '.cb3d-bar.is-phone{left:6px;right:6px;top:auto;bottom:6px;max-width:none;flex-wrap:nowrap;justify-content:center;overflow-x:auto;overflow-y:hidden;gap:6px;scrollbar-width:none;-webkit-overflow-scrolling:touch;touch-action:pan-x}',
     '.cb3d-bar.is-phone::-webkit-scrollbar{display:none}',
     '.cb3d-bar.is-phone .cb3d-grp-l{display:none}',
-    '.cb3d-grp.is-vert{position:absolute;right:8px;top:8px;flex-direction:column;border-radius:18px;pointer-events:auto}',
-    '.cb3d-grp.is-vert .cb3d-btn{width:32px;height:32px;min-width:32px;padding:0}',
+    '.cb3d-grp.is-vert{position:absolute;right:8px;top:8px;flex-direction:column;border-radius:20px;pointer-events:auto}',
+    '.cb3d-grp.is-vert .cb3d-btn{width:34px;height:34px;min-width:34px;padding:0}',
     '.cb3d-grp.is-vert .cb3d-btn span{display:none}',
     '.cb3d-bar.is-hidden{visibility:hidden}',
-    '.cb3d-grp{display:inline-flex;align-items:center;gap:2px;padding:2px;border-radius:999px;background:var(--cb3d-tip);border:1px solid var(--cb3d-line);flex:none;box-shadow:0 1px 2px var(--cb3d-shadow-s)}',
-    '.cb3d-grp-l{padding:0 3px 0 7px;font-size:11px;color:var(--cb3d-muted);white-space:nowrap}',
-    '.cb3d-ov .cb3d-btn{-webkit-appearance:none;appearance:none;margin:0;border:0;background:transparent;color:var(--cb3d-fg);font:600 12px/1 Inter,system-ui,sans-serif;height:26px;min-width:26px;padding:0 9px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;gap:5px;cursor:pointer;white-space:nowrap;touch-action:manipulation;-webkit-tap-highlight-color:transparent;transition:background-color .12s ease,color .12s ease;pointer-events:auto}',
+    '.cb3d-grp{display:inline-flex;align-items:center;gap:2px;padding:2px;border-radius:999px;background:var(--cb3d-tip);border:1px solid var(--cb3d-line);flex:none;' +
+      'box-shadow:inset 0 1px 0 var(--cb3d-rim),0 10px 24px -16px var(--cb3d-shadow)}',
+    '.cb3d-grp-l{padding:0 4px 0 9px;font:600 9.5px/1 ' + F_UI + ';letter-spacing:.14em;text-transform:uppercase;color:var(--cb3d-muted);white-space:nowrap}',
+    '.cb3d-ov .cb3d-btn{-webkit-appearance:none;appearance:none;margin:0;border:0;background:transparent;color:var(--cb3d-fg2);font:500 12px/1 ' + F_UI + ';height:26px;min-width:26px;padding:0 10px;' +
+      'border-radius:999px;display:inline-flex;align-items:center;justify-content:center;gap:5px;cursor:pointer;white-space:nowrap;touch-action:manipulation;-webkit-tap-highlight-color:transparent;' +
+      'transition:background-color .15s ease,color .15s ease,box-shadow .15s ease;pointer-events:auto}',
     '.cb3d-ov .cb3d-btn.is-icon{padding:0;width:26px}',
-    '.cb3d-ov .cb3d-btn:hover{background:var(--cb3d-hover)}',
-    '.cb3d-ov .cb3d-btn[aria-pressed="true"],.cb3d-ov .cb3d-btn.is-solid{background:var(--cb3d-fg);color:var(--cb3d-surface)}',
+    '.cb3d-ov .cb3d-btn:hover{background:var(--cb3d-hover);color:var(--cb3d-fg)}',
+    '.cb3d-ov .cb3d-btn[aria-pressed="true"]{background:var(--cb3d-gold-soft);color:var(--cb3d-gold);box-shadow:inset 0 0 0 1px var(--cb3d-gold-line)}',
+    '.cb3d-ov .cb3d-btn.is-solid{background:var(--cb3d-accent);color:var(--cb3d-gold-ink);font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 6px 16px -8px var(--cb3d-gold-line)}',
+    '.cb3d-ov .cb3d-btn.is-solid:hover{background:var(--cb3d-accent-hi);color:var(--cb3d-gold-ink)}',
     '.cb3d-ov .cb3d-btn.is-line{box-shadow:inset 0 0 0 1px var(--cb3d-line)}',
+    '.cb3d-ov .cb3d-btn.is-line:hover{box-shadow:inset 0 0 0 1px var(--cb3d-gold-line)}',
     '.cb3d-ov .cb3d-btn:focus{outline:none}',
-    '.cb3d-ov .cb3d-btn:focus-visible{outline:2px solid var(--cb3d-accent);outline-offset:2px}',
-    '.cb3d-bar.is-phone .cb3d-btn{height:32px;min-width:32px;padding:0 8px}',
+    '.cb3d-ov .cb3d-btn:focus-visible{box-shadow:0 0 0 2px var(--cb3d-surface),0 0 0 4px var(--cb3d-focus)}',
+    '.cb3d-ov .cb3d-btn:active{transform:translateY(.5px)}',
+    '.cb3d-bar.is-phone .cb3d-btn{height:34px;min-width:34px;padding:0 10px}',
     // galaxy selection card
-    '.cb3d-card{position:absolute;right:10px;bottom:10px;width:300px;max-width:calc(100% - 20px);display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 10px;padding:10px 10px 10px 12px;border-radius:12px;background:var(--cb3d-tip);border:1px solid var(--cb3d-line);box-shadow:0 10px 30px var(--cb3d-shadow);pointer-events:auto;line-height:1.4;font-variant-numeric:tabular-nums;opacity:0;visibility:hidden;transform:translateY(6px);transition:opacity .16s ease,transform .16s ease,visibility 0s linear .16s}',
-    '.cb3d-card.is-on{opacity:1;visibility:visible;transform:none;transition:opacity .16s ease,transform .16s ease}',
+    '.cb3d-card{position:absolute;right:10px;bottom:10px;width:312px;max-width:calc(100% - 20px);display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;padding:12px 12px 12px 14px;' +
+      'border-radius:14px;background:var(--cb3d-tip);border:1px solid var(--cb3d-line);box-shadow:inset 0 1px 0 var(--cb3d-rim),0 28px 64px -28px var(--cb3d-shadow);pointer-events:auto;' +
+      'line-height:1.45;font-variant-numeric:tabular-nums;color:var(--cb3d-fg2);opacity:0;visibility:hidden;transform:translateY(8px) scale(.985);transform-origin:100% 100%;' +
+      'transition:opacity .22s ' + EZ + ',transform .36s ' + EZ + ',visibility 0s linear .22s}',
+    '.cb3d-card.is-on{opacity:1;visibility:visible;transform:none;transition:opacity .22s ' + EZ + ',transform .36s ' + EZ + '}',
     '.cb3d-card.is-phone{left:8px;right:8px;bottom:8px;width:auto;max-width:none}',
-    '.cb3d-card-info{min-width:0;display:grid;gap:1px;align-content:start}',
+    '.cb3d-card-info{min-width:0;display:grid;gap:2px;align-content:start}',
     '.cb3d-card-info>div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.cb3d-card-info>.cb3d-row{flex-wrap:wrap;white-space:normal;row-gap:0}',
-    '.cb3d-card-h{display:flex;align-items:center;gap:6px;min-width:0;padding-right:2px}',
-    '.cb3d-card-h .cb3d-t1{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}',
-    '.cb3d-card-side{display:flex;flex-direction:column;align-items:flex-end;justify-content:space-between;gap:6px}',
-    '.cb3d-card-acts{display:flex;flex-direction:column;gap:5px;align-items:stretch}',
+    '.cb3d-card-h{display:flex;align-items:center;gap:7px;min-width:0;padding-right:2px;margin-bottom:1px}',
+    '.cb3d-card-h .cb3d-t1{font:500 17px/1.2 ' + F_DISP + ';letter-spacing:.005em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}',
+    '.cb3d-card-side{display:flex;flex-direction:column;align-items:flex-end;justify-content:space-between;gap:8px}',
+    '.cb3d-card-acts{display:flex;flex-direction:column;gap:6px;align-items:stretch}',
     '.cb3d-card .cb3d-btn{height:28px}',
-    '.cb3d-card.is-phone .cb3d-btn{height:32px}',
-    // galaxy tags & key
-    '.cb3d-tag{position:absolute;left:0;top:0;display:flex;align-items:center;gap:4px;height:18px;max-width:150px;padding:0 6px;border-radius:5px;background:var(--cb3d-panel);border:1px solid var(--cb3d-line);color:var(--cb3d-fg);font-size:11px;line-height:16px;white-space:nowrap;transition:opacity .2s ease;will-change:transform}',
-    '.cb3d-tag.is-sel{height:21px;max-width:190px;font-size:12px;font-weight:700;border-color:var(--cb3d-fg);box-shadow:0 2px 8px var(--cb3d-shadow-s)}',
-    '.cb3d-tag.is-hl{border-color:var(--cb3d-muted)}',
-    '.cb3d-dq{display:inline-flex;align-items:center;height:15px;padding:0 4px;border-radius:4px;font-size:10px;font-weight:700;line-height:1;background:rgba(227,73,72,.14);box-shadow:inset 0 0 0 1px rgba(227,73,72,.6);color:var(--cb3d-fg);flex:none;letter-spacing:.02em}',
-    '.cb3d-leader{position:absolute;left:0;top:0;height:1px;width:10px;background:var(--cb3d-fg);opacity:.55;transform-origin:0 50%}',
-    '.cb3d-key{position:absolute;left:12px;bottom:8px;display:flex;flex-wrap:nowrap;gap:10px;max-width:calc(100% - 24px);overflow:hidden;font-size:11px;line-height:14px;color:var(--cb3d-muted);text-shadow:0 0 3px var(--cb3d-surface),0 0 5px var(--cb3d-surface)}',
+    '.cb3d-card.is-phone .cb3d-btn{height:34px}',
+    // galaxy name tags & key
+    '.cb3d-tag{position:absolute;left:0;top:0;display:flex;align-items:center;gap:5px;height:20px;max-width:156px;padding:0 7px 0 6px;border-radius:6px;background:var(--cb3d-panel);' +
+      'border:1px solid var(--cb3d-line-s);box-shadow:inset 0 1px 0 var(--cb3d-rim);color:var(--cb3d-fg2);font-size:11px;line-height:18px;white-space:nowrap;transition:opacity .3s ' + EZ + ';will-change:transform}',
+    '.cb3d-tag.is-sel{height:23px;max-width:196px;font-size:12px;font-weight:600;color:var(--cb3d-fg);border-color:var(--cb3d-gold-line);box-shadow:inset 0 1px 0 var(--cb3d-rim),0 6px 16px -8px var(--cb3d-shadow)}',
+    '.cb3d-tag.is-hl{border-color:var(--cb3d-line);color:var(--cb3d-fg)}',
+    '.cb3d-dq{display:inline-flex;align-items:center;height:15px;padding:0 4px;border-radius:4px;font:600 9.5px/1 ' + F_MONO + ';background:var(--cb3d-ko-soft);' +
+      'box-shadow:inset 0 0 0 1px var(--cb3d-ko-line);color:var(--cb3d-fg);flex:none;letter-spacing:.04em}',
+    '.cb3d-leader{position:absolute;left:0;top:0;height:1px;width:10px;background:var(--cb3d-gold);opacity:.6;transform-origin:0 50%}',
+    '.cb3d-key{position:absolute;left:12px;bottom:9px;display:flex;flex-wrap:nowrap;gap:12px;max-width:calc(100% - 24px);overflow:hidden;font-size:11px;line-height:14px;color:var(--cb3d-muted);' +
+      'text-shadow:0 0 3px var(--cb3d-surface),0 0 6px var(--cb3d-surface)}',
     '.cb3d-key.is-clip{-webkit-mask-image:linear-gradient(90deg,#000 88%,transparent);mask-image:linear-gradient(90deg,#000 88%,transparent)}',
     '.cb3d-bar.is-compact .cb3d-grp-l{display:none}',
-    '.cb3d-key span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}',
-    '.cb3d-ko{display:inline-block;width:7px;height:7px;transform:rotate(45deg);box-shadow:inset 0 0 0 1.5px #e34948;flex:none}',
+    '.cb3d-key span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}',
+    '.cb3d-ko{display:inline-block;width:7px;height:7px;transform:rotate(45deg);box-shadow:inset 0 0 0 1.5px var(--cb3d-ko);flex:none}',
+    '@media (prefers-reduced-motion:reduce){.cb3d-ov,.cb3d-ov *{transition-duration:.01s !important}}',
   ].join('\n');
   let styleRefs = 0;
   let styleEl = null;
@@ -204,17 +268,6 @@
   }
 
   // ───────── shared GPU helpers ─────────
-  function radialTexture(stops, size) {
-    size = size || 128;
-    const c = document.createElement('canvas');
-    c.width = c.height = size;
-    const g = c.getContext('2d');
-    const gr = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-    stops.forEach((s) => gr.addColorStop(s[0], s[1]));
-    g.fillStyle = gr;
-    g.fillRect(0, 0, size, size);
-    return new THREE.CanvasTexture(c);
-  }
   function circleGeometry(seg, plane) {
     const p = [];
     for (let i = 0; i < seg; i++) {
@@ -231,54 +284,73 @@
     g.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
     return g;
   }
-  /** Studio environment from emissive softboxes (the mascot.js recipe), lighter backdrop for light themes. */
-  function studioEnv(renderer, dark) {
-    const pm = new THREE.PMREMGenerator(renderer);
-    const env = new THREE.Scene();
-    const trash = [];
-    const add = (geo, mat, pos) => {
-      trash.push(geo, mat);
-      const m = new THREE.Mesh(geo, mat);
-      if (pos) { m.position.set(pos[0], pos[1], pos[2]); m.lookAt(0, 0, 0); }
-      env.add(m);
+  /** One onBeforeCompile per material (r128 runs exactly one): optional radial resize of a unit-radius lathe/torus
+   *  (uR — any outer radius without distorting fillets or tube), the fresnel rim of premium-3d.md §7 (brightens
+   *  emissive and raises alpha at grazing angles) and extra patches. Uniform objects live in mat.userData.cb. */
+  function shade(mat, o) {
+    const U = {};
+    if (o.uR) U.uR = o.uR;
+    if (o.rim) {
+      U.uRim = { value: new THREE.Color(1, 1, 1) };
+      U.uRimP = { value: o.rim.power || 3 };
+      U.uRimK = { value: o.rim.k === undefined ? 0.8 : o.rim.k };
+      U.uRimA = { value: o.rim.alpha === undefined ? 0.35 : o.rim.alpha };
+    }
+    mat.userData.cb = U;
+    mat.onBeforeCompile = (sh) => {
+      Object.assign(sh.uniforms, U);
+      if (U.uR) {
+        sh.vertexShader = 'uniform float uR;\n' + sh.vertexShader.replace('#include <begin_vertex>',
+          '#include <begin_vertex>\n\t{ float l = length(transformed.xz); if (l > 1e-4) transformed.xz *= max(0.0, uR + l - 1.0) / l; }');
+      }
+      if (U.uRim) {
+        sh.fragmentShader = 'uniform vec3 uRim;\nuniform float uRimP;\nuniform float uRimK;\nuniform float uRimA;\n' + sh.fragmentShader
+          .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n\tfloat rimF = pow(1.0 - clamp(abs(dot(normal, normalize(vViewPosition))), 0.0, 1.0), uRimP);\n\ttotalEmissiveRadiance += uRim * rimF * uRimK;')
+          .replace('gl_FragColor = vec4( outgoingLight, diffuseColor.a );', 'gl_FragColor = vec4( outgoingLight, clamp( diffuseColor.a + rimF * uRimA, 0.0, 1.0 ) );');
+      }
+      if (o.extra) o.extra(sh);
     };
-    add(new THREE.BoxGeometry(24, 24, 24), new THREE.MeshBasicMaterial({ color: dark ? 0x2a2f38 : 0x6d7480, side: THREE.BackSide }));
-    const panel = (w, h, color, k, pos) => add(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(k), side: THREE.DoubleSide }), pos);
-    panel(9, 6, '#ffffff', 5.0, [-6, 7, 7]); // key softbox
-    panel(7, 7, '#dbe6ff', 1.8, [9, 1.5, 3]); // cool fill
-    panel(8, 3, '#ffd84a', 2.6, [1, 4, -10]); // warm brand rim
-    panel(16, 3, '#ffffff', 1.1, [0, -8, 1]); // floor bounce
-    panel(3, 10, '#ffffff', 2.2, [-11, 0, -2]); // strip light
-    const rt = pm.fromScene(env, 0.035);
-    pm.dispose();
-    trash.forEach((d) => d.dispose());
-    return rt;
+    mat.customProgramCacheKey = () => 'cb3d-' + o.key;
+    return mat;
   }
+  /** Fake crystal blending: on dark pages reflections add light (ONE, 1-srcA) while the body still darkens what is
+   *  behind; on ivory plain alpha blending so the bronze edges read. */
+  function crystalBlend(m, dark) {
+    if (dark) {
+      m.blending = THREE.CustomBlending;
+      m.blendSrc = THREE.OneFactor;
+      m.blendDst = THREE.OneMinusSrcAlphaFactor;
+      m.blendEquation = THREE.AddEquation;
+    } else m.blending = THREE.NormalBlending;
+  }
+  /** Hemisphere + key + warm rim (premium-3d.md §7); the shared studio environment does most of the work. */
   function addLights(scene) {
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x3a4250, 0.35);
-    const key = new THREE.DirectionalLight(0xffffff, 0.9);
+    const hemi = new THREE.HemisphereLight(0xffffff, lin('#2a2f38'), 0.3);
+    const key = new THREE.DirectionalLight(0xffffff, 0.7);
     key.position.set(-3, 4, 5);
-    const rim = new THREE.DirectionalLight(0xffd36a, 0.7);
+    const rim = new THREE.DirectionalLight(lin('#FFE6C4'), 0.65);
     rim.position.set(3, 2, -4);
     scene.add(hemi, key, rim);
     return { hemi, key, rim };
   }
-  /** Lets a unit-radius lathe/torus take any outer radius `uR` without distorting fillets or tube. */
-  function radialize(mat, uR, key, extra) {
-    mat.onBeforeCompile = (sh) => {
-      sh.uniforms.uR = uR;
-      sh.vertexShader = 'uniform float uR;\n' + sh.vertexShader.replace(
-        '#include <begin_vertex>',
-        '#include <begin_vertex>\n\t{ float l = length(transformed.xz); if (l > 1e-4) transformed.xz *= max(0.0, uR + l - 1.0) / l; }'
-      );
-      if (extra) extra(sh);
-    };
-    mat.customProgramCacheKey = () => 'cb3d-radial-' + key;
-    return mat;
+  /** Three depth layers of slow dust (far / mid / near, 150–400 motes after the tier scale) from the hub kit. */
+  function addDust(parent, layers) {
+    const G = GLH();
+    const out = [];
+    if (!G || !G.kit || typeof G.kit.dust !== 'function') return out;
+    layers.forEach((L) => {
+      try {
+        const p = G.kit.dust(L);
+        if (p) { parent.add(p); out.push(p); }
+      } catch (e) { /* dust is a nicety */ }
+    });
+    return out;
   }
 
-  // ═════════ Stage: renderer, camera rig, pointer input, overlay, frame pacing, lifecycle ═════════
+  // ═════════ Stage: hub view, camera rig, pointer input, overlay, pacing, lifecycle ═════════
   function createStage(container, cfg) {
+    const G = GLH();
+    if (!G) throw new Error('CB.GL is not loaded');
     const mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
     retainStyle();
     let posPatched = false;
@@ -289,33 +361,10 @@
         posPatched = true;
       }
     } catch (e) { /* detached container */ }
-
-    let renderer;
-    try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'default' });
-    } catch (e) {
-      if (posPatched) container.style.position = prevPosition;
-      releaseStyle();
-      throw e;
-    }
-    const ratioFor = (cw) => Math.min(window.devicePixelRatio || 1, cw && cw < 560 ? 1.5 : 2);
-    renderer.setPixelRatio(ratioFor(container.clientWidth));
-    renderer.setClearColor(0x000000, 0);
-    renderer.outputEncoding = THREE.sRGBEncoding;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = cfg.exposure || 1;
-
-    const canvas = renderer.domElement;
-    canvas.className = 'cb3d-canvas';
-    if (cfg.touchAction) canvas.style.touchAction = cfg.touchAction;
-    canvas.setAttribute('role', 'img');
-    const overlay = el('div', 'cb3d-ov');
-    container.appendChild(canvas);
-    container.appendChild(overlay);
-    const tip = el('div', 'cb3d-tip', overlay);
-    tip.setAttribute('aria-hidden', 'true');
+    container.classList.add('cb3d-host');
 
     const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x000000, 0);
     const camera = new THREE.PerspectiveCamera(cfg.fov, 1, 0.05, 60);
     const pivot = new THREE.Group();
     scene.add(pivot);
@@ -326,24 +375,25 @@
     const tmpF = new THREE.Vector3();
     const AXIS_Y = new THREE.Vector3(0, 1, 0);
     const disposables = new Set();
+    const offs = [];
 
-    let w = 0, h = 0, raf = 0, lastDraw = 0, destroyed = false, dirty = true, lastActive = false;
-    let visible = typeof IntersectionObserver === 'undefined';
+    let w = 0, h = 0, destroyed = false, rigMoved = true, firstFrame = true, autoTimer = 0, autoMoving = false;
     let vYaw = 0, vPitch = 0, swayT = 0, tween = null;
     let lastInteract = nowMs() - 3000 + (cfg.autoDelay || 0);
     let tipW = 0, tipH = 0, tipHTML = '';
     const pointers = new Map();
-    let drag = null, pinch = null, hoverDirty = false, rigMoved = true;
+    let drag = null, pinch = null, hoverDirty = false;
     let lastTap = { t: 0, x: 0, y: 0 };
     const ptr = { x: 0, y: 0, inside: false };
-    let envRT = null, envDark = null;
+    const par = { x: 0, y: 0, tx: 0, ty: 0 }; // pointer parallax (radians), critically damped
+    const PAR_X = (cfg.parallax === undefined ? 3.5 : cfg.parallax) * DEG, PAR_Y = PAR_X * 0.6;
 
     const S = {
-      renderer, scene, camera, pivot, canvas, overlay, target, raycaster,
+      scene, camera, pivot, canvas: null, overlay: null, view: null, target, raycaster,
       yaw: cfg.yaw || 0, pitch: cfg.pitch || 0.3, zoom: 1, zoomT: 1, focus: new THREE.Vector3(),
       baseDist: 5, offsetX: 0, offsetY: 0,
-      reduced: !!(mq && mq.matches), autoOn: cfg.auto !== 'none', busyUntil: 0, holdAuto: false,
-      theme: normTheme(cfg.theme), dark: false,
+      reduced: !!(mq && mq.matches), autoOn: false, busyUntil: 0, holdAuto: false,
+      theme: normTheme(cfg.theme), dark: true, pal: PAL.dark, quality: safeQuality(G),
       hooks: {}, ptr, cfg,
       get w() { return w; },
       get h() { return h; },
@@ -351,36 +401,74 @@
       kick, project, showTip, hideTip, placeTip, moveTip, tipSize, rayAt, setCursor, destroy, applyThemeVars, resize, flyTo,
       dragging: () => !!(drag && drag.moved),
       interacted() { lastInteract = nowMs(); swayT = 0; },
-      busy(ms) { S.busyUntil = Math.max(S.busyUntil, nowMs() + ms); kick(); },
+      busy(ms) { S.busyUntil = Math.max(S.busyUntil, nowMs() + ms); if (view && !destroyed) view.kick(ms); },
+      /** Explicit auto-orbit (galaxy toolbar): the user's choice, rendered at ≤ 30 fps while visible. */
+      setAuto(on) {
+        S.autoOn = !!on;
+        if (!S.autoOn && autoTimer) { clearTimeout(autoTimer); autoTimer = 0; }
+        kick();
+      },
     };
 
-    // ── theme → CSS variables on the overlay + studio environment ──
+    // ── the hub view: render + blit into a 2D canvas that the hub inserts as the host's first child ──
+    const view = G.view(container, {
+      scene, camera, update: frame, onResize: () => resize(), interactive: true, ambient: true, clearAlpha: 0, poster: 'css',
+      intro: S.reduced ? 0 : 1400, name: cfg.name || 'viz3d', label: cfg.label || '3D chart',
+    });
+    S.view = view;
+    const canvas = view.el;
+    if (!canvas) {
+      try { view.dispose(); } catch (e) { /* noop */ }
+      container.classList.remove('cb3d-host');
+      if (posPatched) container.style.position = prevPosition;
+      releaseStyle();
+      throw new Error('3D view could not be created');
+    }
+    S.canvas = canvas;
+    canvas.classList.add('cb3d-canvas');
+    if (cfg.touchAction) canvas.style.touchAction = cfg.touchAction;
+    const overlay = el('div', 'cb3d-ov');
+    container.appendChild(overlay);
+    S.overlay = overlay;
+    const tip = el('div', 'cb3d-tip', overlay);
+    tip.setAttribute('aria-hidden', 'true');
+
+    // ── theme → CSS variables on the overlay + the hub's shared studio environment ──
     function applyThemeVars(theme) {
       S.theme = normTheme(theme, S.theme);
       const t = S.theme;
       S.dark = luminance(t.surface) < 0.4;
+      S.pal = S.dark ? PAL.dark : PAL.light;
+      const d = S.dark;
+      const gold = d ? t.accent : '#86662B'; // champagne text on obsidian, bronze text on ivory (luxury-ui.md)
       const st = overlay.style;
       st.setProperty('--cb3d-fg', t.fg);
+      st.setProperty('--cb3d-fg2', mixHex(t.fg, t.surface, d ? 0.2 : 0.18));
       st.setProperty('--cb3d-muted', t.muted);
       st.setProperty('--cb3d-surface', t.surface);
       st.setProperty('--cb3d-accent', t.accent);
-      st.setProperty('--cb3d-panel', rgba(t.surface, 0.86));
-      st.setProperty('--cb3d-tip', rgba(t.surface, 0.95));
-      st.setProperty('--cb3d-hover', rgba(t.fg, 0.08));
-      st.setProperty('--cb3d-line', t.grid);
-      st.setProperty('--cb3d-lead', rgba(t.muted, 0.45));
-      st.setProperty('--cb3d-shadow', S.dark ? 'rgba(0,0,0,.45)' : 'rgba(16,24,40,.12)');
-      st.setProperty('--cb3d-shadow-s', S.dark ? 'rgba(0,0,0,.3)' : 'rgba(16,24,40,.06)');
-      if (envDark !== S.dark) {
-        try {
-          const rt = studioEnv(renderer, S.dark);
-          scene.environment = rt.texture;
-          if (envRT) envRT.dispose();
-          envRT = rt;
-          envDark = S.dark;
-        } catch (e) { /* environment is a nicety */ }
-      }
-      renderer.toneMappingExposure = (cfg.exposure || 1) * (S.dark ? 1.04 : 1);
+      st.setProperty('--cb3d-accent-hi', mixHex(t.accent, '#ffffff', 0.12));
+      st.setProperty('--cb3d-gold', gold);
+      st.setProperty('--cb3d-gold-ink', '#1B1509');
+      st.setProperty('--cb3d-gold-soft', rgba(t.accent, d ? 0.13 : 0.16));
+      st.setProperty('--cb3d-gold-line', rgba(t.accent, d ? 0.42 : 0.6));
+      st.setProperty('--cb3d-focus', rgba(t.accent, 0.65));
+      st.setProperty('--cb3d-panel', rgba(mixHex(t.surface, t.fg, d ? 0.03 : 0), d ? 0.84 : 0.9));
+      st.setProperty('--cb3d-tip', rgba(mixHex(t.surface, t.fg, d ? 0.055 : 0), 0.97));
+      st.setProperty('--cb3d-hover', rgba(t.fg, d ? 0.07 : 0.06));
+      st.setProperty('--cb3d-lead', rgba(d ? t.accent : t.muted, d ? 0.5 : 0.55));
+      st.setProperty('--cb3d-lead0', rgba(d ? t.accent : t.muted, 0.08));
+      st.setProperty('--cb3d-dot-ring', d ? 'rgba(255,250,240,.14)' : 'rgba(40,32,18,.14)');
+      st.setProperty('--cb3d-shadow', d ? 'rgba(0,0,0,.7)' : 'rgba(40,32,18,.26)');
+      st.setProperty('--cb3d-ko', KNOCK_COLOR);
+      st.setProperty('--cb3d-ko-soft', rgba(KNOCK_COLOR, 0.14));
+      st.setProperty('--cb3d-ko-line', rgba(KNOCK_COLOR, 0.6));
+      let env = null;
+      try { env = G.env(d ? 'dark' : 'light'); } catch (e) { env = null; }
+      scene.environment = env || null;
+      // r128 applies fog after tone mapping + sRGB encoding, so the fog colour is the page colour as-is.
+      scene.fog.color.copy(colorOf(t.surface));
+      kick();
     }
     applyThemeVars(cfg.theme);
 
@@ -450,20 +538,24 @@
       tween = tw;
       vYaw = 0;
       vPitch = 0;
-      kick();
+      if (!destroyed) view.kick(tw.dur + 120);
     }
     function placeCamera() {
       const d = S.baseDist * S.zoom;
       tmpF.copy(S.focus).applyAxisAngle(AXIS_Y, S.yaw);
       const tx = target.x + tmpF.x, ty = target.y + tmpF.y, tz = target.z + tmpF.z;
-      camera.position.set(tx, ty + Math.sin(S.pitch) * d, tz + Math.cos(S.pitch) * d);
+      const p = S.pitch + par.y, cp = Math.cos(p) * d;
+      camera.position.set(tx + Math.sin(par.x) * cp, ty + Math.sin(p) * d, tz + Math.cos(par.x) * cp);
       camera.lookAt(tx, ty, tz);
       pivot.rotation.y = S.yaw;
       camera.updateMatrixWorld();
       pivot.updateMatrixWorld();
+      scene.fog.density = cfg.fogK ? cfg.fogK / Math.max(0.5, d) : 0;
     }
+    /** Advances the rig; returns true while something needs native-rate frames (tween, inertia, zoom, parallax). */
     function rigStep(dt, t) {
-      let moving = false;
+      let fast = false;
+      autoMoving = false;
       if (tween) {
         const k = clamp((t - tween.t0) / tween.dur, 0, 1), e = tween.ease(k);
         S.yaw = lerp(tween.yaw0, tween.yaw1, e);
@@ -471,7 +563,7 @@
         S.zoom = S.zoomT = lerp(tween.zoom0, tween.zoom1, e);
         S.focus.lerpVectors(tween.focus0, tween.focus1, e);
         if (k >= 1) tween = null;
-        moving = true;
+        fast = true;
       } else if (!drag) {
         if (vYaw !== 0 || vPitch !== 0) {
           S.yaw += vYaw * dt;
@@ -480,18 +572,18 @@
           vPitch *= Math.exp(-dt * 6);
           if (Math.abs(vYaw) < 0.004) vYaw = 0;
           if (Math.abs(vPitch) < 0.004) vPitch = 0;
-          moving = true;
+          fast = true;
         }
         const idle = t - lastInteract;
-        if (!S.reduced && S.autoOn && !S.holdAuto && idle > 3000) {
-          const ramp = clamp((idle - 3000) / 1500, 0, 1);
+        if (!S.reduced && S.autoOn && !S.holdAuto && idle > 1200) {
+          const ramp = clamp((idle - 1200) / 1500, 0, 1);
           if (cfg.auto === 'sway') {
             swayT += dt * ramp;
             S.yaw += cfg.swayAmp * cfg.swayW * Math.cos(cfg.swayW * swayT) * ramp * dt;
           } else {
-            S.yaw += cfg.autoSpeed * ramp * dt;
+            S.yaw += (cfg.autoSpeed || 0.04) * ramp * dt;
           }
-          moving = true;
+          autoMoving = true;
         }
       }
       if (S.pitch < cfg.minPitch) { S.pitch = cfg.minPitch; vPitch = 0; }
@@ -499,61 +591,55 @@
       if (!tween) {
         if (Math.abs(S.zoomT - S.zoom) > 1e-4) {
           S.zoom = lerp(S.zoom, S.zoomT, 1 - Math.exp(-dt * 12));
-          moving = true;
+          fast = true;
         } else S.zoom = S.zoomT;
       }
+      // pointer parallax: critically damped, 1 - exp(-dt·6)
+      const pk = S.reduced ? 1 : 1 - Math.exp(-dt * 6);
+      if (Math.abs(par.tx - par.x) > 2e-4 || Math.abs(par.ty - par.y) > 2e-4) {
+        par.x += (par.tx - par.x) * pk;
+        par.y += (par.ty - par.y) * pk;
+        fast = true;
+      } else { par.x = par.tx; par.y = par.ty; }
       if (!tween && (S.yaw > Math.PI * 4 || S.yaw < -Math.PI * 4)) S.yaw %= TAU;
       placeCamera();
-      return moving;
+      return fast;
     }
 
-    // ── loop: full rate while interacting/tweening, ≤30 fps ambient, stopped when idle ──
-    function canRun() {
-      return !destroyed && visible && !document.hidden && w > 0 && h > 0;
+    // ── per-frame: called by the hub right before it renders this view ──
+    function autoTick() {
+      autoTimer = 0;
+      if (!destroyed && S.autoOn && !S.reduced) view.invalidate();
+    }
+    function frame(dt) {
+      if (destroyed) return false;
+      const t = nowMs();
+      if (firstFrame) {
+        firstFrame = false;
+        if (S.hooks.first) S.hooks.first(t);
+      }
+      const fast = rigStep(dt, t);
+      const moved = fast || autoMoving || rigMoved;
+      rigMoved = false;
+      if (ptr.inside && !drag && (hoverDirty || moved) && S.hooks.hover) S.hooks.hover(ptr.x, ptr.y);
+      hoverDirty = false;
+      const active = S.hooks.frame ? !!S.hooks.frame(dt, t) : false;
+      if (S.hooks.post) S.hooks.post(t);
+      if (fast || active || pinch) view.kick(160); // native rate only while something is actually moving
+      if (S.autoOn && !S.reduced && !autoTimer) autoTimer = setTimeout(autoTick, 33); // explicit auto-orbit ≤ 30 fps
+      return fast || active || autoMoving || (!S.reduced && !!(S.hooks.ambient && S.hooks.ambient()));
     }
     function kick() {
-      dirty = true;
-      if (!raf && canRun()) raf = requestAnimationFrame(frame);
-    }
-    function stop() {
-      if (raf) cancelAnimationFrame(raf);
-      raf = 0;
-      lastDraw = 0;
-    }
-    function frame() {
-      raf = 0;
-      if (!canRun()) { lastDraw = 0; return; }
-      const t = nowMs();
-      const fast = !!drag || !!pinch || !!tween || vYaw !== 0 || vPitch !== 0 || Math.abs(S.zoomT - S.zoom) > 1e-4 || lastActive || t < S.busyUntil;
-      if (!fast && !dirty && lastDraw && t - lastDraw < 32) {
-        raf = requestAnimationFrame(frame);
-        return;
-      }
-      dirty = false;
-      const dt = lastDraw ? clamp((t - lastDraw) / 1000, 0, 0.1) : 1 / 60;
-      lastDraw = t;
-      const moving = rigStep(dt, t) || rigMoved;
-      rigMoved = false;
-      if (ptr.inside && !drag && (hoverDirty || moving) && S.hooks.hover) S.hooks.hover(ptr.x, ptr.y);
-      hoverDirty = false;
-      lastActive = S.hooks.frame ? !!S.hooks.frame(dt, t) : false;
-      renderer.render(scene, camera);
-      if (S.hooks.post) S.hooks.post(t);
-      const ambient = !S.reduced && (S.hooks.ambient ? S.hooks.ambient() : false);
-      const keep = t - lastInteract < (cfg.keepAlive || 0);
-      if (fast || moving || lastActive || ambient || keep || drag) raf = requestAnimationFrame(frame);
-      else lastDraw = 0;
+      if (!destroyed) view.invalidate();
     }
 
-    // ── size ──
+    // ── size: CSS px from the host; the hub owns the device-pixel buffer ──
     function resize() {
       if (destroyed) return;
       const nw = Math.round(container.clientWidth), nh = Math.round(container.clientHeight);
-      if (!nw || !nh) { w = nw; h = nh; stop(); return; }
       w = nw;
       h = nh;
-      renderer.setPixelRatio(ratioFor(w));
-      renderer.setSize(w, h, false);
+      if (!nw || !nh) return;
       camera.aspect = w / h;
       const L = S.hooks.layout ? S.hooks.layout(w, h) : null;
       if (L) {
@@ -577,8 +663,8 @@
       return typeof ts === 'number' && ts > 0 && Math.abs(n - ts) < 10000 ? ts : n;
     }
     function local(e) {
-      const r = canvas.getBoundingClientRect();
-      return { x: e.clientX - r.left, y: e.clientY - r.top };
+      const r = container.getBoundingClientRect(); // not the canvas: it scales .96→1 during the entry cross-fade
+      return { x: e.clientX - r.left - (container.clientLeft || 0), y: e.clientY - r.top - (container.clientTop || 0) };
     }
     function onDown(e) {
       if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -636,6 +722,10 @@
         ptr.y = p.y;
         ptr.inside = true;
         hoverDirty = true;
+        if (!S.reduced && w > 0 && h > 0) {
+          par.tx = clamp(p.x / w - 0.5, -0.5, 0.5) * 2 * PAR_X;
+          par.ty = -clamp(p.y / h - 0.5, -0.5, 0.5) * 2 * PAR_Y;
+        }
         kick();
       }
     }
@@ -666,6 +756,7 @@
         } else {
           vYaw = clamp(vYaw, -6, 6);
           vPitch = clamp(vPitch, -3, 3);
+          view.kick(1800); // inertia glides at the native rate
         }
         if (e.pointerType === 'mouse') {
           const p = local(e);
@@ -683,8 +774,10 @@
     function onLeave(e) {
       if (e.pointerType !== 'mouse') return;
       ptr.inside = false;
+      par.tx = 0;
+      par.ty = 0;
       if (S.hooks.leave) S.hooks.leave();
-      kick();
+      view.kick(600);
     }
     function onWheel(e) {
       if (!(e.ctrlKey || e.metaKey)) return; // plain wheel scrolls the page
@@ -693,7 +786,7 @@
       tween = null;
       S.zoomT = clamp(S.zoomT * Math.exp(clamp(dy, -60, 60) * 0.01), cfg.zoomMin, cfg.zoomMax);
       S.interacted();
-      kick();
+      view.kick(400);
     }
     const onCtx = (e) => { if (drag && drag.moved) e.preventDefault(); };
     const onGesture = (e) => e.preventDefault(); // Safari trackpad/touch pinch on the canvas only
@@ -706,27 +799,10 @@
     canvas.addEventListener('contextmenu', onCtx);
     if (cfg.touchAction === 'none') canvas.addEventListener('gesturestart', onGesture);
 
-    // ── visibility, size, motion preference ──
-    let io = null, ro = null;
-    if (typeof IntersectionObserver !== 'undefined') {
-      io = new IntersectionObserver((entries) => {
-        const en = entries[entries.length - 1];
-        visible = !!(en && en.isIntersecting);
-        if (visible) kick();
-        else stop();
-      });
-      io.observe(container);
-    }
-    if (typeof ResizeObserver !== 'undefined') {
-      ro = new ResizeObserver(() => resize());
-      ro.observe(container);
-    } else {
-      window.addEventListener('resize', resize);
-    }
-    const onVis = () => (document.hidden ? stop() : kick());
-    document.addEventListener('visibilitychange', onVis);
+    // ── motion preference, quality tier, Safe Mode, context restore ──
     const onMotion = () => {
       S.reduced = !!(mq && mq.matches);
+      if (S.reduced) { par.tx = par.ty = par.x = par.y = 0; }
       if (S.hooks.motion) S.hooks.motion();
       rigMoved = true;
       kick();
@@ -735,16 +811,35 @@
       if (mq.addEventListener) mq.addEventListener('change', onMotion);
       else if (mq.addListener) mq.addListener(onMotion);
     }
+    const syncSafe = () => {
+      const safe = !!view.safe;
+      overlay.classList.toggle('is-safe', safe);
+      if (!safe) resize();
+    };
+    const listen = (evt, fn) => {
+      try {
+        const off = G.on(evt, fn);
+        if (typeof off === 'function') offs.push(off);
+      } catch (e) { /* older hub */ }
+    };
+    listen('tier', () => {
+      if (destroyed) return;
+      S.quality = safeQuality(G);
+      if (S.hooks.quality) { try { S.hooks.quality(S.quality); } catch (e) { /* noop */ } }
+      syncSafe();
+      kick();
+    });
+    listen('restored', () => { if (!destroyed) { syncSafe(); kick(); } });
+    if (view.safe) overlay.classList.add('is-safe');
 
     // ── teardown ──
     function destroy() {
       if (destroyed) return;
       destroyed = true;
-      stop();
-      if (io) io.disconnect();
-      if (ro) ro.disconnect();
-      else window.removeEventListener('resize', resize);
-      document.removeEventListener('visibilitychange', onVis);
+      if (autoTimer) clearTimeout(autoTimer);
+      autoTimer = 0;
+      offs.forEach((off) => { try { off(); } catch (e) { /* noop */ } });
+      offs.length = 0;
       if (mq) {
         if (mq.removeEventListener) mq.removeEventListener('change', onMotion);
         else if (mq.removeListener) mq.removeListener(onMotion);
@@ -760,31 +855,22 @@
       if (S.hooks.dispose) {
         try { S.hooks.dispose(); } catch (e) { /* ignore */ }
       }
-      scene.traverse((o) => {
-        if (o.geometry && !o.isSprite) disposables.add(o.geometry); // sprite geometry is shared module-wide by three
-        if (o.isInstancedMesh) disposables.add(o);
-        const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
-        mats.forEach((m) => {
-          disposables.add(m);
-          ['map', 'alphaMap', 'emissiveMap'].forEach((k) => { if (m[k]) disposables.add(m[k]); });
-        });
-      });
+      // InstancedMesh.dispose() releases instanceMatrix / instanceColor buffers (the hub frees geometry + materials).
+      scene.traverse((o) => { if (o.isInstancedMesh) { try { o.dispose(); } catch (e) { /* ignore */ } } });
       disposables.forEach((d) => { try { d.dispose(); } catch (e) { /* ignore */ } });
       disposables.clear();
-      if (envRT) envRT.dispose();
+      try { view.dispose(); } catch (e) { /* ignore */ }
       scene.environment = null;
-      try { renderer.renderLists.dispose(); } catch (e) { /* ignore */ }
-      try { renderer.dispose(); } catch (e) { /* ignore */ }
-      try { renderer.forceContextLoss(); } catch (e) { /* ignore */ }
-      canvas.remove();
       overlay.remove();
       pointers.clear();
+      container.classList.remove('cb3d-host');
       if (posPatched) container.style.position = prevPosition;
       releaseStyle();
       S.hooks = {};
     }
 
     S.start = () => resize();
+    if (window.__cbVizDebug) (window.__cbVizStages = window.__cbVizStages || []).push(S); // test-only hook
     return S;
   }
 
@@ -843,7 +929,6 @@
   const FLOOR_Y = -0.14;
   const PITCH0 = 0.3;
   const FILLET = 0.05;
-  const TUBE_R = 0.045;
   const MAX_P = 300;
   const PR_STREAM = 0.02;
   const PR_DROP = 0.026;
@@ -876,6 +961,10 @@
     return pts;
   }
 
+  const SPINDLE_R = 0.017;
+  const STREAM_R = 0.046; // beads spiral down the spindle at this radius
+  const PLINTH_H = 0.075;
+
   function createFunnel(container, opts) {
     if (!container || !available()) return null;
     opts = opts || {};
@@ -883,11 +972,11 @@
     try {
       S = createStage(container, {
         fov: 30, yaw: 0.35, pitch: PITCH0, minPitch: 0.04, maxPitch: 0.62,
-        auto: 'spin', autoSpeed: 6 * DEG, zoomMin: 0.7, zoomMax: 1.6,
-        theme: opts.theme, autoDelay: 1400, touchAction: 'pan-y', exposure: 1.02,
+        auto: 'none', zoomMin: 0.7, zoomMax: 1.6, theme: opts.theme, touchAction: 'pan-y',
+        name: 'Pipeline Tower', label: 'Pipeline tower', fogK: 0.26, parallax: 3,
       });
     } catch (e) {
-      console.warn('[Viz3D] WebGL renderer unavailable:', e && e.message);
+      console.warn('[Viz3D] 3D view unavailable:', e && e.message);
       return null;
     }
     try {
@@ -901,46 +990,63 @@
 
   function buildFunnel(S, opts) {
     const { scene, pivot, camera } = S;
+    const G = GLH();
     const onPick = typeof opts.onPick === 'function' ? opts.onPick : null;
     addLights(scene);
+    const glowTex = G.glowTexture ? G.glowTexture() : null;
+    const shadowTex = G.contactShadowTexture ? G.contactShadowTexture() : null;
 
-    // shared geometry
-    const geoTier = S.track(new THREE.LatheGeometry(tierProfile(), 48));
-    const geoRim = S.track(new THREE.TorusGeometry(1, 0.011, 8, 72).rotateX(Math.PI / 2));
-    const glowTex = S.track(radialTexture([[0, 'rgba(255,255,255,1)'], [0.35, 'rgba(255,255,255,0.55)'], [1, 'rgba(255,255,255,0)']]));
-    const shadowTex = S.track(radialTexture([[0, 'rgba(0,0,0,0.7)'], [0.45, 'rgba(0,0,0,0.32)'], [1, 'rgba(0,0,0,0)']]));
-    const floorTex = S.track(radialTexture([[0, 'rgba(255,255,255,1)'], [0.7, 'rgba(255,255,255,0.75)'], [1, 'rgba(255,255,255,0)']]));
+    // shared geometry (freed by view.dispose(); tiers only swap materials)
+    const geoTier = new THREE.LatheGeometry(tierProfile(), 64);
+    const geoRing = new THREE.TorusGeometry(1, 0.0085, 8, 96).rotateX(Math.PI / 2);
+    const geoPlane = new THREE.PlaneGeometry(1, 1);
 
-    // floor: glossy disc, faint polar grid (spokes make rotation readable), contact shadow, mirrored reflection
-    const floorMat = new THREE.MeshBasicMaterial({ map: floorTex, transparent: true, opacity: 0.55, depthWrite: false, toneMapped: false });
-    const floor = new THREE.Mesh(new THREE.CircleGeometry(FLOOR_R, 64), floorMat);
+    // ── the vitrine: black-lacquer plinth, champagne bezel + engraved dial, contact shadows ──
+    // champagne metal; shares the bezels' program (uR = 1 is the identity), so the scene compiles one program fewer
+    const metalMat = shade(new THREE.MeshStandardMaterial({ metalness: 1, roughness: 0.24, envMapIntensity: 1.45 }), { uR: { value: 1 }, key: 'bezel' });
+    const floorMat = new THREE.MeshPhysicalMaterial({ metalness: 0, roughness: 0.18, clearcoat: 1, clearcoatRoughness: 0.04, envMapIntensity: 0.85, transparent: true, depthWrite: false });
+    const floor = new THREE.Mesh(new THREE.CircleGeometry(FLOOR_R, 96), floorMat);
     floor.rotation.x = -Math.PI / 2;
     floor.position.y = FLOOR_Y;
-    floor.renderOrder = -4;
-    pivot.add(floor);
-    const polar = [];
-    [0.55, FLOOR_R * 0.985].forEach((r) => {
-      for (let i = 0; i < 64; i++) {
-        const a0 = (i / 64) * TAU, a1 = ((i + 1) / 64) * TAU;
-        polar.push(Math.cos(a0) * r, 0, Math.sin(a0) * r, Math.cos(a1) * r, 0, Math.sin(a1) * r);
+    floor.renderOrder = -6;
+    const wallMat = new THREE.MeshPhysicalMaterial({ metalness: 0, roughness: 0.22, clearcoat: 1, clearcoatRoughness: 0.06, envMapIntensity: 1.1 });
+    const wall = new THREE.Mesh(new THREE.CylinderGeometry(FLOOR_R, FLOOR_R * 0.965, PLINTH_H, 96, 1, true), wallMat);
+    wall.position.y = FLOOR_Y - PLINTH_H / 2;
+    const bezel = new THREE.Mesh(new THREE.TorusGeometry(FLOOR_R, 0.012, 10, 160).rotateX(Math.PI / 2), metalMat);
+    bezel.position.y = FLOOR_Y;
+    const foot = new THREE.Mesh(new THREE.TorusGeometry(FLOOR_R * 0.965, 0.006, 6, 128).rotateX(Math.PI / 2), metalMat);
+    foot.position.y = FLOOR_Y - PLINTH_H;
+    pivot.add(floor, wall, bezel, foot);
+    // engraved dial: two rings, 60 minute indices (every 5th longer) — rotation reads like a watch bezel
+    const dial = [];
+    [0.6, FLOOR_R * 0.9].forEach((r) => {
+      for (let i = 0; i < 96; i++) {
+        const a0 = (i / 96) * TAU, a1 = ((i + 1) / 96) * TAU;
+        dial.push(Math.cos(a0) * r, 0, Math.sin(a0) * r, Math.cos(a1) * r, 0, Math.sin(a1) * r);
       }
     });
-    for (let i = 0; i < 12; i++) {
-      const a = (i / 12) * TAU;
-      polar.push(Math.cos(a) * 0.62, 0, Math.sin(a) * 0.62, Math.cos(a) * FLOOR_R * 0.985, 0, Math.sin(a) * FLOOR_R * 0.985);
+    for (let i = 0; i < 60; i++) {
+      const a = (i / 60) * TAU, r0 = FLOOR_R * (i % 5 ? 0.925 : 0.905), r1 = FLOOR_R * 0.965;
+      dial.push(Math.cos(a) * r0, 0, Math.sin(a) * r0, Math.cos(a) * r1, 0, Math.sin(a) * r1);
     }
-    const polarMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.22, depthWrite: false, toneMapped: false });
-    const polarLines = new THREE.LineSegments(segmentsGeometry(polar), polarMat);
-    polarLines.position.y = FLOOR_Y + 0.001;
-    polarLines.renderOrder = -1;
+    const polarMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.25, depthWrite: false, toneMapped: false });
+    const polarLines = new THREE.LineSegments(segmentsGeometry(dial), polarMat);
+    polarLines.position.y = FLOOR_Y + 0.0015;
+    polarLines.renderOrder = -4;
     pivot.add(polarLines);
     const shadowMat = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, opacity: 0.4, depthWrite: false, toneMapped: false });
-    const shadow = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), shadowMat);
+    const shadow = new THREE.Mesh(geoPlane, shadowMat);
     shadow.rotation.x = -Math.PI / 2;
-    shadow.position.y = FLOOR_Y + 0.002;
-    shadow.renderOrder = -2;
-    pivot.add(shadow);
-    const reflectRoot = new THREE.Group(); // mirrored about the floor plane
+    shadow.position.y = FLOOR_Y + 0.003;
+    shadow.renderOrder = -3;
+    const plinthShadowMat = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
+    const plinthShadow = new THREE.Mesh(geoPlane, plinthShadowMat);
+    plinthShadow.rotation.x = -Math.PI / 2;
+    plinthShadow.position.y = FLOOR_Y - PLINTH_H - 0.004;
+    plinthShadow.scale.set(FLOOR_R * 3.1, FLOOR_R * 3.1, 1);
+    plinthShadow.renderOrder = -8;
+    pivot.add(shadow, plinthShadow);
+    const reflectRoot = new THREE.Group(); // mirrored about the floor plane; clipped to the disc in the shader
     reflectRoot.scale.y = -1;
     reflectRoot.position.y = 2 * FLOOR_Y;
     pivot.add(reflectRoot);
@@ -948,18 +1054,26 @@
     const tower = new THREE.Group();
     pivot.add(tower);
 
-    // central glass tube the flow runs down
-    const tubeMat = new THREE.MeshPhysicalMaterial({
-      color: 0xe8eef6, metalness: 0, roughness: 0.05, clearcoat: 1, clearcoatRoughness: 0.03, transmission: 0.88,
-      transparent: true, depthWrite: false, side: THREE.DoubleSide, envMapIntensity: 1.3,
-    });
-    const tube = new THREE.Mesh(new THREE.CylinderGeometry(TUBE_R, TUBE_R, 1, 20, 1, true), tubeMat);
-    tube.renderOrder = 2;
-    tower.add(tube);
+    // champagne spindle with a finial (the beads spiral down it), a collar on the plinth, washers between tiers
+    const spindle = new THREE.Mesh(new THREE.CylinderGeometry(SPINDLE_R, SPINDLE_R, 1, 20), metalMat);
+    const finial = new THREE.Mesh(new THREE.SphereGeometry(0.042, 28, 18), metalMat);
+    const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.092, 0.05, 48), metalMat);
+    collar.position.y = FLOOR_Y + 0.025;
+    const finialGlowMat = new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false, toneMapped: false });
+    const finialGlow = new THREE.Sprite(finialGlowMat);
+    finialGlow.renderOrder = 6;
+    tower.add(spindle, finial, collar, finialGlow);
+    const washerMat = new THREE.MeshStandardMaterial({ metalness: 1, roughness: 0.28, envMapIntensity: 1.35 });
+    const MAX_W = 24;
+    const washers = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.058, 0.058, 0.012, 32), washerMat, MAX_W);
+    washers.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    washers.frustumCulled = false;
+    washers.count = 0;
+    tower.add(washers);
 
     // glossy flow beads — one InstancedMesh, shrink-to-fade
-    const beadMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.18, metalness: 0.05, clearcoat: 1, clearcoatRoughness: 0.06, envMapIntensity: 1.1 });
-    const beads = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 14, 10), beadMat, MAX_P);
+    const beadMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.14, metalness: 0.25, envMapIntensity: 1.5 });
+    const beads = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 16, 12), beadMat, MAX_P);
     beads.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_P * 3), 3);
     beads.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     beads.instanceColor.setUsage(THREE.DynamicDrawUsage);
@@ -967,12 +1081,22 @@
     beads.count = 0;
     pivot.add(beads);
 
-    // particle state: 0 dead · 1 falling in tube · 2 rolling to the rim · 3 airborne · 4 fading on the floor
+    // slow dust in three depth layers (scene space, so drags rotate the tower through it)
+    const dustRoot = new THREE.Group();
+    scene.add(dustRoot);
+    const dust = addDust(dustRoot, [
+      { count: 120, spread: [5.6, 3.2, 1.6], center: [0, 0, -2.0], size: 0.011, opacity: 0.5, drift: 0.04 },
+      { count: 80, spread: [3.4, 2.8, 2.2], center: [0, 0, 0], size: 0.013, opacity: 0.5, drift: 0.05 },
+      { count: 30, spread: [3.2, 2.4, 1.0], center: [0, 0, 2.3], size: 0.016, opacity: 0.32, drift: 0.06 },
+    ]);
+
+    // particle state: 0 dead · 1 falling down the spindle · 2 rolling to the rim · 3 airborne · 4 fading on the floor
     const pSt = new Uint8Array(MAX_P), pKind = new Uint8Array(MAX_P), pTier = new Int16Array(MAX_P), pBounce = new Uint8Array(MAX_P);
     const pX = new Float32Array(MAX_P), pY = new Float32Array(MAX_P), pZ = new Float32Array(MAX_P);
     const pVx = new Float32Array(MAX_P), pVy = new Float32Array(MAX_P), pVz = new Float32Array(MAX_P);
     const pAng = new Float32Array(MAX_P), pRad = new Float32Array(MAX_P), pSpd = new Float32Array(MAX_P), pAge = new Float32Array(MAX_P), pR = new Float32Array(MAX_P);
-    const palette = [new THREE.Color(), lin(DROP[0].color), lin(DROP[1].color), lin(DROP[2].color), new THREE.Color()];
+    const palette = [new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color()];
+    let dropCols = DROP.map((d) => d.color);
     let spawnAcc = 0, spawnRate = 0, cursor = 0;
     const m4 = new THREE.Matrix4(), q0 = new THREE.Quaternion(), sv = new THREE.Vector3(), pv = new THREE.Vector3();
 
@@ -991,13 +1115,13 @@
     let colMaxW = 200;
     let leadGap = 18;
     let legendW = 0, legendH = 0;
-    let dollyPending = !S.reduced;
     let exitP = [];
     const tmp = new THREE.Vector3();
     const right = new THREE.Vector3();
     const P = { x: 0, y: 0, ok: true };
     const P2 = { x: 0, y: 0, ok: true };
     const screen = [];
+    const cA = new THREE.Color(), cB = new THREE.Color();
 
     function measureLegend() {
       legendW = legend.offsetWidth;
@@ -1033,21 +1157,50 @@
       t.chip.el.remove();
       t.lead.remove();
     }
-    function glassMat(col, side, uR, transmission, opacity) {
-      return radialize(new THREE.MeshPhysicalMaterial({
-        color: col, emissive: col, emissiveIntensity: 0.06, metalness: 0, roughness: 0.08,
-        clearcoat: 1, clearcoatRoughness: 0.04, transmission, transparent: true, opacity, side, depthWrite: false, envMapIntensity: 1.25,
-      }), uR, 'glass');
+    /** Fake crystal (premium-3d.md rec. 9): transparent clearcoat, near-black body, jewel-ink emissive, fresnel rim. */
+    function crystalMat(side, uR) {
+      return shade(new THREE.MeshPhysicalMaterial({
+        color: 0x000000, emissive: 0x000000, emissiveIntensity: 0.16, metalness: 0, roughness: 0.06, clearcoat: 1, clearcoatRoughness: 0.03,
+        transparent: true, opacity: 0.28, side, depthWrite: false, envMapIntensity: 1.7,
+      }), { uR, rim: { power: 6, k: 0.9, alpha: 0.35 }, key: 'tier' });
     }
-    /** Brushed steel tinted a little by the stage; darker steel on light pages so the rim still reads. */
-    function rimColor(col) {
-      return new THREE.Color(S.dark ? 0xcfd4dc : 0x8d949f).lerp(col, 0.18);
+    function bezelMat(uR) {
+      return shade(new THREE.MeshStandardMaterial({ metalness: 1, roughness: 0.22, envMapIntensity: 1.5 }), { uR, key: 'bezel' });
     }
-    function reflMat(col, uR) {
-      return radialize(new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.2, depthWrite: false, toneMapped: false }), uR, 'refl', (sh) => {
-        sh.vertexShader = 'varying float vWY;\n' + sh.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n\tvWY = (modelMatrix * vec4(transformed, 1.0)).y;');
-        sh.fragmentShader = 'varying float vWY;\n' + sh.fragmentShader.replace('#include <color_fragment>', '#include <color_fragment>\n\tdiffuseColor.a *= clamp(1.0 - (' + FLOOR_Y.toFixed(3) + ' - vWY) / 0.55, 0.0, 1.0);');
+    const FY = FLOOR_Y.toFixed(4), FR = (FLOOR_R * 0.985).toFixed(4);
+    /** Mirror image under the lacquer: fades with depth and is clipped to what is seen THROUGH the plinth top. */
+    function reflMat(uR) {
+      return shade(new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.2, depthWrite: false, toneMapped: false }), {
+        uR, key: 'refl',
+        extra: (sh) => {
+          sh.vertexShader = 'varying vec3 vWP;\n' + sh.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n\tvWP = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+          sh.fragmentShader = 'varying vec3 vWP;\n' + sh.fragmentShader.replace('#include <color_fragment>', '#include <color_fragment>\n' +
+            '\t{ float dep = ' + FY + ' - vWP.y; diffuseColor.a *= clamp(1.0 - dep / 0.5, 0.0, 1.0);\n' +
+            '\t  vec3 rd = vWP - cameraPosition; float ry = abs(rd.y) > 1e-4 ? rd.y : -1e-4;\n' +
+            '\t  vec2 hit = cameraPosition.xz + rd.xz * ((' + FY + ' - cameraPosition.y) / ry);\n' +
+            '\t  if (dot(hit, hit) > ' + FR + ' * ' + FR + ') discard; }');
+        },
       });
+    }
+    /** Theme + ink → tier materials (body, rim, bezel, glow, reflection). */
+    function colorTier(T) {
+      const dark = S.dark, P = S.pal;
+      const ink = T.col;
+      const champ = lin(P.metal, cA);
+      const [backM, frontM, bezM, glowM, reflM] = T.mats;
+      [backM, frontM].forEach((m, k) => {
+        m.color.copy(ink).multiplyScalar(dark ? 0.04 : 0.85);
+        m.emissive.copy(ink);
+        m.envMapIntensity = (dark ? 0.55 : 0.7) * (k ? 1 : 0.45);
+        m.roughness = dark ? 0.06 : 0.1;
+        m.userData.cb.uRim.value.copy(ink).lerp(champ, dark ? 0.3 : 0.3);
+        m.userData.cb.uRimA.value = dark ? 0.22 : 0.45;
+        crystalBlend(m, dark);
+      });
+      bezM.color.copy(champ).lerp(ink, 0.1);
+      glowM.color.copy(lin(P.glow, cB)).lerp(ink, dark ? 0.3 : 0.55);
+      glowM.blending = dark ? THREE.AdditiveBlending : THREE.NormalBlending;
+      reflM.color.copy(ink);
     }
 
     function rebuild(animate) {
@@ -1057,30 +1210,33 @@
       H = stackHeight(n);
       const max = stages.reduce((m, s) => Math.max(m, s.count), 0);
       const t0 = nowMs();
+      const shells = S.quality.shells !== false;
       stages.forEach((s, i) => {
         const col = lin(s.color);
         const r = radiusFor(s.count, max);
         const uR = { value: r };
-        const backMat = glassMat(col, THREE.BackSide, uR, 0.9, 1);
-        const frontMat = glassMat(col, THREE.FrontSide, uR, 0.66, 1);
-        const rimMat = radialize(new THREE.MeshStandardMaterial({ color: rimColor(col), metalness: 1, roughness: 0.3, envMapIntensity: 1.15, transparent: true, opacity: 1 }), uR, 'rim');
-        const glowMat = new THREE.SpriteMaterial({ map: glowTex, color: col, transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
-        const rMat = reflMat(col, uR);
+        const backMat = crystalMat(THREE.BackSide, uR);
+        const frontMat = crystalMat(THREE.FrontSide, uR);
+        const bzMat = bezelMat(uR);
+        const glowMat = new THREE.SpriteMaterial({ map: glowTex, transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
+        const rMat = reflMat(uR);
         const group = new THREE.Group();
         const back = new THREE.Mesh(geoTier, backMat);
         back.renderOrder = 1;
+        back.visible = shells;
         const front = new THREE.Mesh(geoTier, frontMat);
         front.renderOrder = 3;
-        const rim = new THREE.Mesh(geoRim, rimMat);
-        rim.position.y = TIER_H / 2 - FILLET;
-        rim.renderOrder = 0;
+        const ringTop = new THREE.Mesh(geoRing, bzMat);
+        ringTop.position.y = TIER_H / 2 - FILLET;
+        const ringBot = new THREE.Mesh(geoRing, bzMat);
+        ringBot.position.y = -(TIER_H / 2 - FILLET);
         const glow = new THREE.Sprite(glowMat);
-        glow.renderOrder = 2.5;
-        group.add(back, front, rim, glow);
+        glow.renderOrder = 2;
+        group.add(back, front, ringTop, ringBot, glow);
         group.position.y = tierY(i);
         tower.add(group);
         const refl = new THREE.Mesh(geoTier, rMat);
-        refl.renderOrder = -3;
+        refl.renderOrder = -5;
         reflectRoot.add(refl);
 
         const chip = makeLabel(labelLayer, 'cb3d-chip is-pick', chipHTML(i));
@@ -1088,11 +1244,12 @@
         chip.el.setAttribute('tabindex', '0');
         const lead = el('div', 'cb3d-lead', labelLayer);
         const T = {
-          key: s.key, index: i, col, group, back, front, rim, glow, refl, chip, lead, uR,
-          mats: [backMat, frontMat, rimMat, glowMat, rMat],
+          key: s.key, index: i, col, group, back, front, glow, refl, chip, lead, uR,
+          mats: [backMat, frontMat, bzMat, glowMat, rMat],
           rFrom: r, rTo: r, rNow: r, tStart: t0, glowK: max > 0 ? Math.sqrt(s.count / max) : 0,
-          appear: animate && !S.reduced ? 0 : 1, appearDelay: 120 + i * 60, hv: 0, empty: s.count === 0,
+          appear: animate && !S.reduced ? 0 : 1, appearDelay: 160 + i * 70, hv: 0, empty: s.count === 0,
         };
+        colorTier(T);
         bindChip(T);
         tiers.push(T);
       });
@@ -1100,8 +1257,10 @@
       resetParticles();
       tiers.forEach((t) => measure(t.chip));
       const top = H + 0.3;
-      tube.scale.y = top - FLOOR_Y;
-      tube.position.y = (top + FLOOR_Y) / 2;
+      spindle.scale.y = top - FLOOR_Y;
+      spindle.position.y = (top + FLOOR_Y) / 2;
+      finial.position.y = top + 0.03;
+      finialGlow.position.y = top + 0.03;
       hot = -1;
       S.hideTip();
     }
@@ -1221,7 +1380,7 @@
           pKind[i] = 0;
           pAge[i] = 0;
           pAng[i] = Math.random() * TAU;
-          pRad[i] = Math.random() * (TUBE_R - PR_STREAM - 0.004);
+          pRad[i] = STREAM_R + (Math.random() - 0.5) * 0.008;
           pSpd[i] = 0.6 * (0.9 + Math.random() * 0.2);
           pTier[i] = 0;
           pBounce[i] = 0;
@@ -1256,7 +1415,7 @@
               pSt[i] = 2;
               pKind[i] = pickDropKind();
               pAng[i] = Math.random() * TAU;
-              pRad[i] = TUBE_R + PR_DROP;
+              pRad[i] = STREAM_R + PR_DROP;
               pR[i] = PR_DROP;
               pAge[i] = 0;
               break;
@@ -1346,21 +1505,26 @@
     // ── theme ──
     function applyTheme(theme) {
       S.applyThemeVars(theme);
-      const t = S.theme;
-      lin(t.grid, floorMat.color);
-      floorMat.opacity = S.dark ? 0.6 : 0.7;
-      lin(t.muted, polarMat.color);
-      polarMat.opacity = S.dark ? 0.26 : 0.2;
-      shadowMat.opacity = S.dark ? 0.7 : 0.24;
-      lin(S.dark ? '#eef1f6' : '#3a414e', palette[0]);
+      const t = S.theme, P = S.pal, dark = S.dark;
+      lin(P.lacquer, floorMat.color);
+      lin(P.lacquer, wallMat.color);
+      floorMat.envMapIntensity = dark ? 0.28 : 0.4;
+      floorMat.roughness = dark ? 0.3 : 0.34;
+      floorMat.clearcoat = dark ? 0.6 : 0.5;
+      wallMat.envMapIntensity = dark ? 0.7 : 0.6;
+      lin(P.metal, metalMat.color);
+      lin(P.metal, washerMat.color);
+      lin(P.engrave, polarMat.color);
+      polarMat.opacity = dark ? 0.24 : 0.34;
+      shadowMat.opacity = dark ? 0.6 : 0.22;
+      plinthShadowMat.opacity = dark ? 0.7 : 0.34;
+      lin(P.glow, finialGlowMat.color);
+      finialGlowMat.blending = dark ? THREE.AdditiveBlending : THREE.NormalBlending;
+      dropCols = [0, 1, 2].map(dropColor);
+      lin(P.bead, palette[0]);
+      for (let k = 0; k < 3; k++) lin(dropCols[k], palette[k + 1]);
       lin(t.muted, palette[4]);
-      // glass: more body colour and less env glare on light pages, where the background is already bright
-      tiers.forEach((T) => {
-        T.mats[0].transmission = S.dark ? 0.9 : 0.8;
-        T.mats[1].transmission = S.dark ? 0.66 : 0.5;
-        T.mats[0].envMapIntensity = T.mats[1].envMapIntensity = S.dark ? 1.25 : 1.0;
-        T.mats[2].color.copy(rimColor(T.col));
-      });
+      tiers.forEach(colorTier);
       tiers.forEach((T) => measure(T.chip));
       writeBeads();
     }
@@ -1413,24 +1577,32 @@
         presimulate();
       }
     };
-    S.hooks.ambient = () => spawnRate > 0 || S.autoOn;
+    S.hooks.ambient = () => true; // beads, dust and glow breathe at ≤ 30 fps for 4 s after input, then the frame holds
+    S.hooks.quality = (q) => {
+      tiers.forEach((T) => { T.back.visible = q.shells !== false; });
+      finialGlow.visible = q.glow !== false;
+    };
+    S.hooks.first = (t) => {
+      S.appearStart = t;
+      if (!S.reduced) S.flyTo({ zoom: 1 }, 1400, 'out'); // 8 % dolly-in under the hub's 600 ms cross-fade
+      S.busy(1800);
+    };
 
+    const wq = new THREE.Quaternion(), wv = new THREE.Vector3(), ws = new THREE.Vector3(), wm = new THREE.Matrix4();
     S.hooks.frame = (dt, t) => {
       let active = false;
       if (!S.appearStart) S.appearStart = t;
-      if (dollyPending) {
-        dollyPending = false;
-        S.flyTo({ zoom: 1 }, 1200, 'out');
-      }
       const dark = S.dark;
-      let maxR = 0;
+      const breathe = S.reduced ? 0 : Math.sin((t / 1000) * TAU * 0.25);
+      const glowOn = S.quality.glow !== false;
+      let maxR = 0, nW = 0;
       for (const T of tiers) {
         if (T.appear < 1) {
-          T.appear = S.reduced ? 1 : clamp((t - S.appearStart - T.appearDelay) / 560, 0, 1);
+          T.appear = S.reduced ? 1 : clamp((t - S.appearStart - T.appearDelay) / 620, 0, 1);
           active = true;
         }
         if (T.rNow !== T.rTo) {
-          const k = S.reduced ? 1 : (t - T.tStart) / 600;
+          const k = S.reduced ? 1 : (t - T.tStart) / 650;
           T.rNow = k >= 1 ? T.rTo : lerp(T.rFrom, T.rTo, easeOut(k));
           active = true;
         }
@@ -1440,7 +1612,7 @@
           active = true;
         }
         const e = easeOut(T.appear);
-        const hs = 1 + 0.04 * T.hv;
+        const hs = 1 + 0.035 * T.hv;
         const sxz = (0.55 + 0.45 * e) * hs;
         T.uR.value = T.rNow;
         T.group.scale.set(sxz, Math.max(0.001, e) * hs, sxz);
@@ -1448,19 +1620,39 @@
         T.refl.position.copy(T.group.position);
         T.refl.scale.copy(T.group.scale);
         const glass = T.empty ? 0.45 : 1;
-        T.mats[0].opacity = e * glass;
-        T.mats[1].opacity = e * glass;
-        T.mats[2].opacity = e;
-        T.mats[3].opacity = T.empty ? 0 : (dark ? 0.55 : 0.42) * e * (1 + 0.4 * T.hv);
-        T.glow.scale.setScalar((0.25 + 1.1 * T.glowK) * T.rNow * 1.25 * e + 0.0001);
-        T.mats[4].opacity = (dark ? 0.16 : 0.2) * e * glass;
-        const em = (dark ? 0.12 : 0.05) + 0.35 * T.hv;
-        T.mats[0].emissiveIntensity = em;
-        T.mats[1].emissiveIntensity = em;
+        const base = dark ? 0.22 : 0.42;
+        const [backM, frontM, , glowM, reflM] = T.mats;
+        frontM.opacity = base * e * glass;
+        backM.opacity = base * 0.55 * e * glass;
+        const em = ((dark ? 0.24 : 0.1) + 0.4 * T.hv) * glass;
+        frontM.emissiveIntensity = em;
+        backM.emissiveIntensity = em * 0.8;
+        frontM.userData.cb.uRimK.value = (dark ? 1.0 : 0.8) + 0.9 * T.hv;
+        glowM.opacity = T.empty || !glowOn ? 0 : (dark ? 0.28 : 0.12) * e * (0.9 + 0.1 * breathe) * (1 + 0.6 * T.hv);
+        T.glow.scale.setScalar((0.25 + 0.6 * T.glowK) * T.rNow * e + 0.0001);
+        reflM.opacity = (dark ? 0.2 : 0.14) * e * glass;
+        // champagne washers above and below each tier, threaded on the spindle
+        if (nW + 2 <= MAX_W) {
+          const hy = (TIER_H / 2) * T.group.scale.y + 0.006;
+          ws.set(e, 1, e);
+          for (let s = -1; s <= 1; s += 2) {
+            wv.set(0, T.group.position.y + s * hy, 0);
+            wm.compose(wv, wq, ws);
+            washers.setMatrixAt(nW++, wm);
+          }
+        }
         maxR = Math.max(maxR, T.rNow * sxz);
       }
-      const sr = Math.max(0.5, maxR) * 2.1;
+      washers.count = nW;
+      washers.instanceMatrix.needsUpdate = true;
+      const sr = Math.max(0.5, maxR) * 2.3;
       shadow.scale.set(sr, sr, 1);
+      const fg = (S.reduced ? 1 : 0.92 + 0.08 * breathe) * (dark ? 0.55 : 0.22);
+      finialGlowMat.opacity = fg;
+      finialGlow.scale.setScalar(0.42);
+      dustRoot.position.copy(S.target);
+      const focus = S.baseDist * S.zoom;
+      for (let i = 0; i < dust.length; i++) { const u = dust[i].material.uniforms; if (u && u.uFocus) u.uFocus.value = focus; }
       if (!S.reduced) {
         step(dt);
         writeBeads();
@@ -1520,7 +1712,7 @@
 
     function setLegend() {
       const total = drops[0] + drops[1] + drops[2];
-      legend.innerHTML = total ? DROP.map((d, k) => (drops[k] ? '<span><span class="cb3d-dot" style="background:' + d.color + '"></span>' + drops[k] + ' ' + d.label + '</span>' : '')).join('') : '';
+      legend.innerHTML = total ? DROP.map((d, k) => (drops[k] ? '<span><span class="cb3d-dot" style="background:' + esc(dropCols[k]) + '"></span>' + drops[k] + ' ' + d.label + '</span>' : '')).join('') : '';
       measureLegend();
     }
     function setAria() {
@@ -1549,18 +1741,12 @@
           T.tStart = t0;
           T.empty = s.count === 0;
           T.glowK = max > 0 ? Math.sqrt(s.count / max) : 0;
-          const col = lin(s.color);
-          T.col = col;
-          T.mats.forEach((m, k) => {
-            if (k === 2) m.color.copy(rimColor(col));
-            else m.color.copy(col);
-            if (m.emissive) m.emissive.copy(col);
-          });
+          T.col = lin(s.color);
           T.chip.el.innerHTML = chipHTML(i);
           measure(T.chip);
         });
         if (hot >= 0) S.showTip(tipHTML(hot));
-        S.busy(700);
+        S.busy(800);
       }
       refreshFlow();
       applyTheme(theme);
@@ -1581,7 +1767,7 @@
     if (S.reduced) presimulate();
     else {
       warm(3);
-      S.zoom = S.zoomT = 1.42; // dolly-in starts from here on the first rendered frame
+      S.zoom = S.zoomT = 1.08; // the dolly-in starts from here on the first rendered frame
     }
     S.start();
 
@@ -1634,20 +1820,19 @@
   function createGalaxy(container, opts) {
     if (!container || !available()) return null;
     opts = opts || {};
-    let touchDevice = false;
-    try { touchDevice = !!(window.matchMedia && window.matchMedia('(hover: none) and (pointer: coarse)').matches); } catch (e) { /* ignore */ }
     let S;
     try {
       S = createStage(container, {
         fov: 32, yaw: 0.5, pitch: 0.4, minPitch: 0.02, maxPitch: 1.35, pitchGain: 0.8,
         auto: 'sway', swayAmp: 0.36, swayW: TAU / 26, zoomMin: 0.45, zoomMax: 1.8,
-        theme: opts.theme, autoDelay: 600, keepAlive: 2000, touchAction: 'none', exposure: 1.0,
+        theme: opts.theme, autoDelay: 600, touchAction: 'none',
+        name: 'Opportunity Space', label: 'Opportunity space', fogK: 0.32, parallax: 3.5,
       });
     } catch (e) {
-      console.warn('[Viz3D] WebGL renderer unavailable:', e && e.message);
+      console.warn('[Viz3D] 3D view unavailable:', e && e.message);
       return null;
     }
-    S.autoOn = !touchDevice;
+    S.autoOn = false; // auto-orbit is an explicit choice (toolbar): idle stays at 0 fps
     try {
       return buildGalaxy(S, opts);
     } catch (e) {
@@ -1659,26 +1844,34 @@
 
   function buildGalaxy(S, opts) {
     const { scene, pivot, camera } = S;
+    const G = GLH();
     let onPick = typeof opts.onPick === 'function' ? opts.onPick : null;
     let onOpen = typeof opts.onOpen === 'function' ? opts.onOpen : null;
     let onSelect = typeof opts.onSelect === 'function' ? opts.onSelect : null;
     addLights(scene);
     const X = (v) => clamp(v, 0, 100) / 100 - 0.5;
     const YAW0 = S.yaw, PITCH_0 = S.pitch;
+    const glowTex = G.glowTexture ? G.glowTexture() : null;
+    const shadowTex = G.contactShadowTexture ? G.contactShadowTexture() : null;
+    const geoPlane = new THREE.PlaneGeometry(1, 1);
 
-    // floor fill + grid + faint cube edges + axes
-    const floorMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.3, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), floorMat);
-    floor.rotation.x = -Math.PI / 2;
-    floor.position.y = -0.5;
-    floor.renderOrder = -3;
-    pivot.add(floor);
+    // the vitrine floor: black-lacquer plate with a champagne edge, engraved grid, hairline frame, axes
+    const PLATE_T = 0.03;
+    const plateMat = new THREE.MeshPhysicalMaterial({ metalness: 0, roughness: 0.18, clearcoat: 1, clearcoatRoughness: 0.05, envMapIntensity: 1 });
+    const plate = new THREE.Mesh(new THREE.BoxGeometry(1.1, PLATE_T, 1.1), plateMat);
+    plate.position.y = -0.5 - PLATE_T / 2 - 0.002;
+    pivot.add(plate);
+    const pe = 0.55, py = -0.5 - 0.0015;
+    const plateEdgeMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.6, depthWrite: false, toneMapped: false });
+    const plateEdge = new THREE.LineLoop(segmentsGeometry([-pe, py, -pe, pe, py, -pe, pe, py, pe, -pe, py, pe]), plateEdgeMat);
+    plateEdge.renderOrder = -2;
+    pivot.add(plateEdge);
     const g = [];
     for (let i = 0; i <= 10; i++) {
       const v = i / 10 - 0.5;
       g.push(v, -0.5, -0.5, v, -0.5, 0.5, -0.5, -0.5, v, 0.5, -0.5, v);
     }
-    const gridMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.9, depthWrite: false, toneMapped: false });
+    const gridMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.22, depthWrite: false, toneMapped: false });
     const grid = new THREE.LineSegments(segmentsGeometry(g), gridMat);
     grid.renderOrder = -2;
     pivot.add(grid);
@@ -1686,7 +1879,7 @@
       0.5, -0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, -0.5, 0.5, -0.5, 0.5, 0.5,
       -0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5,
     ];
-    const boxMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.6, depthWrite: false, toneMapped: false });
+    const boxMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.3, depthWrite: false, toneMapped: false });
     const box = new THREE.LineSegments(segmentsGeometry(edges), boxMat);
     box.renderOrder = -2;
     pivot.add(box);
@@ -1698,24 +1891,29 @@
       ax.push(-0.5, v, -0.5, -0.53, v, -0.5);
       ax.push(-0.5, -0.5, 0.5 - f, -0.53, -0.5, 0.5 - f);
     });
-    const axisMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.9, depthWrite: false, toneMapped: false });
+    const axisMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.85, depthWrite: false, toneMapped: false });
     const axes = new THREE.LineSegments(segmentsGeometry(ax), axisMat);
     axes.renderOrder = -1;
     pivot.add(axes);
-    // contact shadow under the cloud
-    const shadowTex = S.track(radialTexture([[0, 'rgba(0,0,0,0.45)'], [1, 'rgba(0,0,0,0)']]));
-    const shadowMat = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
-    const cshadow = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5), shadowMat);
+    // contact shadows: under the cloud on the plate, and under the plate itself
+    const shadowMat = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, opacity: 0.45, depthWrite: false, toneMapped: false });
+    const cshadow = new THREE.Mesh(geoPlane, shadowMat);
     cshadow.rotation.x = -Math.PI / 2;
-    cshadow.position.y = -0.499;
+    cshadow.scale.set(1.5, 1.5, 1);
+    cshadow.position.y = -0.4985;
     cshadow.renderOrder = -2.5;
-    pivot.add(cshadow);
+    const plateShadowMat = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
+    const plateShadow = new THREE.Mesh(geoPlane, plateShadowMat);
+    plateShadow.rotation.x = -Math.PI / 2;
+    plateShadow.scale.set(2.2, 2.2, 1);
+    plateShadow.position.y = -0.5 - PLATE_T - 0.012;
+    plateShadow.renderOrder = -8;
+    pivot.add(cshadow, plateShadow);
 
-    // context: cutoff plane, recruiter-review plane, "apply now" corner volume
-    const planeGeo = S.track(new THREE.PlaneGeometry(1, 1));
+    // context: cutoff plane, recruiter-review plane, "apply now" corner volume (champagne, engraved edges)
     const mkPlane = () => {
       const mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.07, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
-      const m = new THREE.Mesh(planeGeo, mat);
+      const m = new THREE.Mesh(geoPlane, mat);
       m.rotation.y = Math.PI / 2;
       m.renderOrder = 4;
       const eMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
@@ -1734,16 +1932,17 @@
     zoneEdges.renderOrder = 3;
     pivot.add(zone, zoneEdges);
 
-    // points
-    const geoSphere = S.track(new THREE.SphereGeometry(1, 22, 16));
-    const geoOct = S.track(new THREE.OctahedronGeometry(1, 0));
-    const glowU = { value: 0.06 };
-    const pointMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.2, metalness: 0.02, clearcoat: 1, clearcoatRoughness: 0.05, envMapIntensity: 1.05 });
-    pointMat.onBeforeCompile = (sh) => {
-      sh.uniforms.uGlow = glowU;
-      sh.fragmentShader = 'uniform float uGlow;\n' + sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += diffuseColor.rgb * uGlow;');
-    };
-    pointMat.customProgramCacheKey = () => 'cb3d-point-glow';
+    // points: jewel-ink clearcoat spheres (one InstancedMesh, setColorAt) with a faint champagne rim
+    const geoSphere = new THREE.SphereGeometry(1, 24, 16);
+    const geoOct = new THREE.OctahedronGeometry(1, 0);
+    const glowU = { value: 0.12 };
+    const pointMat = shade(new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.2, metalness: 0.06, clearcoat: 1, clearcoatRoughness: 0.04, envMapIntensity: 1.25 }), {
+      rim: { power: 3, k: 0.3, alpha: 0 }, key: 'pt',
+      extra: (sh) => {
+        sh.uniforms.uGlow = glowU;
+        sh.fragmentShader = 'uniform float uGlow;\n' + sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += diffuseColor.rgb * uGlow;');
+      },
+    });
     const knockMat = new THREE.MeshBasicMaterial({ color: lin(KNOCK_COLOR), wireframe: true, transparent: true, opacity: 0.95, toneMapped: false });
     let cap = 0, meshN = null, meshK = null;
     function ensureCapacity(n) {
@@ -1763,8 +1962,8 @@
     }
     const dropMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.35, depthWrite: false, toneMapped: false });
     let dropLines = null;
-    // halos: selected (pulsing accent ring), highlighted (fg ring), hovered (thin fg ring)
-    const ringGeo = S.track(new THREE.RingGeometry(0.82, 1, 48));
+    // halos: selected (pulsing gold ring + glow), highlighted (fg ring), hovered (thin fg ring)
+    const ringGeo = new THREE.RingGeometry(0.86, 1, 64);
     const selMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9, depthTest: false, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
     const selRing = new THREE.Mesh(ringGeo, selMat);
     selRing.renderOrder = 20;
@@ -1774,10 +1973,21 @@
     hlRing.renderOrder = 19;
     hlRing.visible = false;
     const hoverMat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.75, depthTest: false, depthWrite: false, toneMapped: false });
-    const hoverRing = new THREE.LineLoop(S.track(circleGeometry(40, 'xy')), hoverMat);
+    const hoverRing = new THREE.LineLoop(circleGeometry(48, 'xy'), hoverMat);
     hoverRing.renderOrder = 18;
     hoverRing.visible = false;
-    scene.add(selRing, hlRing, hoverRing);
+    const selGlowMat = new THREE.SpriteMaterial({ map: glowTex, transparent: true, opacity: 0.5, depthTest: false, depthWrite: false, toneMapped: false });
+    const selGlow = new THREE.Sprite(selGlowMat);
+    selGlow.renderOrder = 17;
+    selGlow.visible = false;
+    scene.add(selRing, hlRing, hoverRing, selGlow);
+
+    // slow dust in three depth layers around the vitrine
+    const dust = addDust(scene, [
+      { count: 110, spread: [3.6, 2.2, 1.2], center: [0, 0, -1.5], size: 0.007, opacity: 0.5, drift: 0.03 },
+      { count: 70, spread: [1.8, 1.4, 1.8], center: [0, 0, 0], size: 0.008, opacity: 0.5, drift: 0.035 },
+      { count: 24, spread: [2.2, 1.5, 0.7], center: [0, 0, 1.45], size: 0.01, opacity: 0.3, drift: 0.04 },
+    ]);
 
     // ── overlay ──
     const tickLayer = el('div', '', S.overlay);
@@ -1844,7 +2054,7 @@
     mkBtn(grpView, ICON.plus, 'Zoom in', () => zoomBy(0.8), { icon: true });
     mkBtn(grpView, ICON.reset, 'Reset view', () => resetView(), { icon: true });
     const autoBtn = mkBtn(grpView, ICON.orbit + '<span>Auto</span>', 'Auto-rotate', () => {
-      S.autoOn = !S.autoOn;
+      S.setAuto(!S.autoOn);
       syncBar();
       S.interacted();
       S.kick();
@@ -2230,28 +2440,45 @@
     // ── theme ──
     function applyTheme(theme) {
       S.applyThemeVars(theme);
-      const t = S.theme;
-      lin(t.grid, floorMat.color);
-      floorMat.opacity = S.dark ? 0.35 : 0.3;
-      lin(t.grid, gridMat.color);
-      gridMat.opacity = S.dark ? 1 : 0.95;
-      lin(t.grid, boxMat.color);
+      const t = S.theme, P = S.pal, dark = S.dark;
+      lin(P.lacquer, plateMat.color);
+      plateMat.envMapIntensity = dark ? 0.28 : 0.4;
+      plateMat.roughness = dark ? 0.3 : 0.34;
+      plateMat.clearcoat = dark ? 0.6 : 0.5;
+      lin(P.engrave, plateEdgeMat.color);
+      plateEdgeMat.opacity = dark ? 0.55 : 0.6;
+      lin(P.engrave, gridMat.color);
+      gridMat.opacity = dark ? 0.2 : 0.26;
+      lin(P.engrave, boxMat.color);
+      boxMat.opacity = dark ? 0.26 : 0.32;
       lin(t.muted, axisMat.color);
+      axisMat.opacity = dark ? 0.8 : 0.85;
       lin(t.muted, cutPlane.mat.color);
       lin(t.muted, cutPlane.eMat.color);
-      cutPlane.mat.opacity = S.dark ? 0.07 : 0.05;
-      lin(t.accent, revPlane.mat.color);
-      lin(t.accent, revPlane.eMat.color);
-      revPlane.mat.opacity = S.dark ? 0.1 : 0.08;
-      lin(t.accent, zoneMat.color);
-      lin(t.accent, zoneEdgeMat.color);
-      zoneMat.opacity = S.dark ? 0.05 : 0.04;
+      cutPlane.mat.opacity = dark ? 0.06 : 0.05;
+      cutPlane.eMat.opacity = dark ? 0.45 : 0.5;
+      lin(P.metal, revPlane.mat.color);
+      lin(P.metal, revPlane.eMat.color);
+      revPlane.mat.opacity = dark ? 0.085 : 0.09;
+      revPlane.eMat.opacity = dark ? 0.6 : 0.7;
+      lin(P.metal, zoneMat.color);
+      lin(P.metal, zoneEdgeMat.color);
+      zoneMat.opacity = dark ? 0.045 : 0.06;
+      zoneEdgeMat.opacity = dark ? 0.3 : 0.38;
       lin(t.accent, selMat.color);
+      lin(P.glow, selGlowMat.color);
+      selGlowMat.blending = dark ? THREE.AdditiveBlending : THREE.NormalBlending;
       lin(t.fg, hlMat.color);
       lin(t.fg, hoverMat.color);
-      shadowMat.opacity = S.dark ? 0.7 : 0.35;
-      dropMat.opacity = (S.dark ? 0.5 : 0.4) * clamp(Math.sqrt(60 / Math.max(1, pts.length)), 0.4, 1);
-      glowU.value = S.dark ? 0.12 : 0.04;
+      shadowMat.opacity = dark ? 0.5 : 0.22;
+      plateShadowMat.opacity = dark ? 0.65 : 0.3;
+      dropMat.opacity = (dark ? 0.5 : 0.42) * clamp(Math.sqrt(60 / Math.max(1, pts.length)), 0.4, 1);
+      glowU.value = dark ? 0.14 : 0.03;
+      lin(P.rim, pointMat.userData.cb.uRim.value);
+      pointMat.userData.cb.uRimK.value = dark ? 0.32 : 0.12;
+      KNOCK_COLOR = cssVar('--st-rejected') || KNOCK_COLOR;
+      lin(KNOCK_COLOR, knockMat.color);
+      if (meshN && pts.length) applyColors();
       ticks.forEach(measure);
       planeLabels.forEach(measure);
       tags.forEach(measure);
@@ -2297,7 +2524,12 @@
     };
     S.hooks.doubleTap = () => resetView();
     S.hooks.motion = () => { appearing = false; writeInstances(nowMs()); };
-    S.hooks.ambient = () => S.autoOn;
+    S.hooks.ambient = () => true; // dust drift + knockout spin at ≤ 30 fps for 4 s after input
+    S.hooks.first = (t) => {
+      appearStart = t;
+      if (!S.reduced) S.flyTo({ zoom: 1 }, 1400, 'out'); // 8 % dolly-in under the hub's cross-fade
+      S.busy(1800);
+    };
 
     S.hooks.frame = (dt, t) => {
       if (!appearStart) appearStart = t;
@@ -2328,11 +2560,16 @@
         ring.scale.set(s, s, s);
         ring.visible = true;
       };
-      const pulse = S.reduced ? 1 : 1 + 0.12 * Math.sin(t / 1000 * 4.4);
+      const wave = S.reduced ? 0.5 : 0.5 + 0.5 * Math.sin((t / 1000) * 4.4);
+      const pulse = S.reduced ? 1 : 1 + 0.12 * Math.sin((t / 1000) * 4.4);
       place(selRing, sel, 2.0 * pulse);
-      selMat.opacity = S.reduced ? 0.9 : 0.62 + 0.3 * (0.5 + 0.5 * Math.sin(t / 1000 * 4.4));
+      selMat.opacity = S.reduced ? 0.9 : 0.62 + 0.3 * wave;
+      place(selGlow, sel, 7.5);
+      selGlowMat.opacity = (S.dark ? 0.42 : 0.2) * (0.85 + 0.15 * wave) * (S.quality.glow === false ? 0 : 1);
       place(hlRing, hl, 1.85);
       place(hoverRing, hot !== sel ? hot : -1, 1.6);
+      const focus = S.baseDist * S.zoom;
+      for (let i = 0; i < dust.length; i++) { const u = dust[i].material.uniforms; if (u && u.uFocus) u.uFocus.value = focus; }
       return active || appearing;
     };
 
@@ -2423,6 +2660,7 @@
     rebuildPoints();
     syncBar();
     applyTheme(opts.theme);
+    if (!S.reduced) S.zoom = S.zoomT = 1.08; // the dolly-in starts from here on the first rendered frame
     S.start();
 
     return {
